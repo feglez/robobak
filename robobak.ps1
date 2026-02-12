@@ -466,6 +466,9 @@ Write-Host "-----------------------------------------------------------------" -
 Get-Content $LogRobo | Select-Object -Last 8
 Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
 Write-Host "   Copy duration: $($copyDuration.ToString('hh\:mm\:ss'))" -ForegroundColor Cyan
+if ($RoboExit -lt 8) {
+    Write-Host "   Note: 1 Extra dir is expected (destination logs folder)" -ForegroundColor DarkGray
+}
 Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
 
 # --- 8. SUMMARY GENERATION (DESTINATION) ---
