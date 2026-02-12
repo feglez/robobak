@@ -67,9 +67,9 @@ function Update-TimesLog {
 
 function Show-Help {
     Write-Host ""
-    Write-Host "================================================================="
-    Write-Host "   HELP: ROBOBAK"
-    Write-Host "================================================================="
+    Write-Host "=================================================================" -ForegroundColor DarkGray
+    Write-Host "   HELP: ROBOBAK" -ForegroundColor Cyan
+    Write-Host "=================================================================" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "   Usage:"
     Write-Host "      .\robobak.ps1 [SourceLetter] [DestLetter] [flags...]"
@@ -140,14 +140,14 @@ for ($i = 2; $i -lt $args.Count; $i++) {
 # --show-progress and --verbose are mutually exclusive:
 # --verbose floods the terminal with every file line, which would break the progress bar
 if ($ShowProgress -and $VerboseMode) {
-    Write-Host "[ERROR] --show-progress and --verbose cannot be used together."
+    Write-Host "[ERROR] --show-progress and --verbose cannot be used together." -ForegroundColor Red
     Read-Host "Press Enter to continue..."
     exit
 }
 
 # Ensure source and destination are not the same drive
 if ($SourceLetter -eq $DestLetter) {
-    Write-Host "[ERROR] Source and destination cannot be the same drive."
+    Write-Host "[ERROR] Source and destination cannot be the same drive." -ForegroundColor Red
     Read-Host "Press Enter to continue..."
     exit
 }
@@ -168,12 +168,12 @@ $TimesLog   = Join-Path $SourceLogsDir "backup_times.txt"
 # --- 2. PHYSICAL EXISTENCE CHECK ---
 
 if (-not (Test-Path $Source)) {
-    Write-Host "[ERROR] Source drive $Source is not available."
+    Write-Host "[ERROR] Source drive $Source is not available." -ForegroundColor Red
     Read-Host "Press Enter to continue..."
     exit
 }
 if (-not (Test-Path $Dest)) {
-    Write-Host "[ERROR] Destination drive $Dest is not available."
+    Write-Host "[ERROR] Destination drive $Dest is not available." -ForegroundColor Red
     Read-Host "Press Enter to continue..."
     exit
 }
@@ -203,19 +203,19 @@ if ([string]::IsNullOrEmpty($DestLabel)) {
 # catch it anyway (a blank label doesn't start with BACKUP_).
 if ([string]::IsNullOrEmpty($SourceLabel)) {
     Write-Host ""
-    Write-Host "================================================================="
-    Write-Host "   WARNING: Source drive ${SourceLetter}:\ has no label"
-    Write-Host "================================================================="
+    Write-Host "=================================================================" -ForegroundColor DarkGray
+    Write-Host "   WARNING: Source drive ${SourceLetter}:\ has no label" -ForegroundColor Yellow
+    Write-Host "=================================================================" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "   The source drive has no volume label (no name)."
-    Write-Host "   If you continue, the label will appear blank in the"
-    Write-Host "   confirmation screen and in the logs."
+    Write-Host "   The source drive has no volume label (no name)." -ForegroundColor Yellow
+    Write-Host "   If you continue, the label will appear blank in the" -ForegroundColor Yellow
+    Write-Host "   confirmation screen and in the logs." -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "   To add a label: cancel now, right-click the drive in"
-    Write-Host "   File Explorer, select Properties, type a name at the"
-    Write-Host "   top, then run the script again."
+    Write-Host "   To add a label: cancel now, right-click the drive in" -ForegroundColor Yellow
+    Write-Host "   File Explorer, select Properties, type a name at the" -ForegroundColor Yellow
+    Write-Host "   top, then run the script again." -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "================================================================="
+    Write-Host "=================================================================" -ForegroundColor DarkGray
     $continueChoice = Read-Host "Type Y to continue anyway, any other key to cancel"
     if ($continueChoice -ne 'Y') {
         Read-Host "Press Enter to continue..."
@@ -228,19 +228,19 @@ if ($DestLabel -notmatch '^BACKUP_') {
     Write-Host ""
     Write-Host ""
     Write-Host ""
-    Write-Host "================================================================="
-    Write-Host "   SAFETY ERROR: INVALID DISK"
-    Write-Host "================================================================="
+    Write-Host "=================================================================" -ForegroundColor DarkGray
+    Write-Host "   SAFETY ERROR: INVALID DISK" -ForegroundColor Red
+    Write-Host "=================================================================" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "   The drive connected at $Dest is named: `"$DestLabel`""
+    Write-Host "   The drive connected at $Dest is named: `"$DestLabel`"" -ForegroundColor Red
     Write-Host ""
-    Write-Host "   REQUIREMENT: To prevent accidents, the destination drive"
-    Write-Host "   must have a name starting with: BACKUP_"
-    Write-Host "   (Examples: BACKUP_1, BACKUP_OFFICE, BACKUP_DISK2)"
+    Write-Host "   REQUIREMENT: To prevent accidents, the destination drive" -ForegroundColor Red
+    Write-Host "   must have a name starting with: BACKUP_" -ForegroundColor Red
+    Write-Host "   (Examples: BACKUP_1, BACKUP_OFFICE, BACKUP_DISK2)" -ForegroundColor Red
     Write-Host ""
-    Write-Host "   Please rename the drive or verify the drive letter."
+    Write-Host "   Please rename the drive or verify the drive letter." -ForegroundColor Red
     Write-Host ""
-    Write-Host "================================================================="
+    Write-Host "=================================================================" -ForegroundColor DarkGray
     Read-Host "Press Enter to continue..."
     exit
 }
@@ -250,22 +250,22 @@ if ($DestLabel -notmatch '^BACKUP_') {
 Write-Host ""
 Write-Host ""
 Write-Host ""
-Write-Host "================================================================="
-Write-Host "                   COPY CONFIRMATION"
-Write-Host "================================================================="
+Write-Host "=================================================================" -ForegroundColor DarkGray
+Write-Host "                   COPY CONFIRMATION" -ForegroundColor Cyan
+Write-Host "=================================================================" -ForegroundColor DarkGray
 Write-Host ""
-Write-Host "   SOURCE (DATA THAT IS KEPT):       $Source  (Label: $SourceLabel)"
-Write-Host "   DESTINATION (DATA THAT IS WIPED): $Dest  (Label: $DestLabel)"
+Write-Host "   SOURCE (DATA THAT IS KEPT):       $Source  (Label: $SourceLabel)" -ForegroundColor White
+Write-Host "   DESTINATION (DATA THAT IS WIPED): $Dest  (Label: $DestLabel)" -ForegroundColor White
 Write-Host ""
-Write-Host "   WARNING: A MIRROR sync (/MIR) will be performed."
-Write-Host "   Any file on $Dest ($DestLabel) that does NOT exist on $Source ($SourceLabel)"
-Write-Host "   will be PERMANENTLY DELETED. $Dest ($DestLabel) will become an"
-Write-Host "   exact copy of $Source ($SourceLabel)."
+Write-Host "   WARNING: A MIRROR sync (/MIR) will be performed." -ForegroundColor Yellow
+Write-Host "   Any file on $Dest ($DestLabel) that does NOT exist on $Source ($SourceLabel)" -ForegroundColor Yellow
+Write-Host "   will be PERMANENTLY DELETED. $Dest ($DestLabel) will become an" -ForegroundColor Yellow
+Write-Host "   exact copy of $Source ($SourceLabel)." -ForegroundColor Yellow
 Write-Host ""
-Write-Host "================================================================="
+Write-Host "=================================================================" -ForegroundColor DarkGray
 $Confirm = Read-Host "Type Y to confirm and continue, any other key to cancel"
 if ($Confirm -ne 'Y') {
-    Write-Host "Operation cancelled by user."
+    Write-Host "Operation cancelled by user." -ForegroundColor DarkYellow
     Read-Host "Press Enter to continue..."
     exit
 }
@@ -292,22 +292,22 @@ if ($SourceUsed -gt $DestTotal) {
     $usedGB  = [math]::Round($SourceUsed / 1GB, 2)
     $totalGB = [math]::Round($DestTotal / 1GB, 2)
     Write-Host ""
-    Write-Host "================================================================="
-    Write-Host "   WARNING: DESTINATION DRIVE IS TOO SMALL"
-    Write-Host "================================================================="
+    Write-Host "=================================================================" -ForegroundColor DarkGray
+    Write-Host "   WARNING: DESTINATION DRIVE IS TOO SMALL" -ForegroundColor Yellow
+    Write-Host "=================================================================" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "   Source used space:        $usedGB GB"
-    Write-Host "   Destination total space:  $totalGB GB"
+    Write-Host "   Source used space:        $usedGB GB" -ForegroundColor Yellow
+    Write-Host "   Destination total space:  $totalGB GB" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "   The destination drive is not large enough to hold all the"
-    Write-Host "   data from the source. If you continue, the backup will be"
-    Write-Host "   incomplete - Robocopy will fail when the destination runs"
-    Write-Host "   out of space."
+    Write-Host "   The destination drive is not large enough to hold all the" -ForegroundColor Yellow
+    Write-Host "   data from the source. If you continue, the backup will be" -ForegroundColor Yellow
+    Write-Host "   incomplete - Robocopy will fail when the destination runs" -ForegroundColor Yellow
+    Write-Host "   out of space." -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "================================================================="
+    Write-Host "=================================================================" -ForegroundColor DarkGray
     $spaceChoice = Read-Host "Type Y to continue anyway (incomplete backup), any other key to cancel"
     if ($spaceChoice -ne 'Y') {
-        Write-Host "Operation cancelled by user."
+        Write-Host "Operation cancelled by user." -ForegroundColor DarkYellow
         Read-Host "Press Enter to continue..."
         exit
     }
@@ -332,7 +332,7 @@ New-Item -Path $DestLogsDir -ItemType Directory -Force | Out-Null
 # --- 7. ROBOCOPY EXECUTION ---
 
 Write-Host ""
-Write-Host "Starting backup from $SourceLabel ($Source) to $DestLabel ($Dest)..."
+Write-Host "Starting backup from $SourceLabel ($Source) to $DestLabel ($Dest)..." -ForegroundColor Cyan
 Write-Host ""
 
 # Build the flags string for logging (empty string if no flags were set)
@@ -381,7 +381,7 @@ if ($ShowProgress) {
     #         file line (empirically confirmed). Without /NP, these percentages would
     #         inflate the file line count used by the progress bar
 
-    Write-Host "Counting files on source drive..."
+    Write-Host "Counting files on source drive..." -ForegroundColor Cyan
     $countStart = Get-Date
     # Note: this counts all files on the source drive. It does not explicitly exclude
     # $RECYCLE.BIN or System Volume Information, but those folders are protected by
@@ -389,8 +389,8 @@ if ($ShowProgress) {
     # silently suppressed, so those files are not included in the count in practice.
     $TotalFiles = (Get-ChildItem -Path $Source -Recurse -File -ErrorAction SilentlyContinue).Count
     $countDuration = (Get-Date) - $countStart
-    Write-Host "Found $($TotalFiles.ToString('N0')) files (counted in $($countDuration.ToString('hh\:mm\:ss'))). Starting backup..."
-    Write-Host "Note: the progress bar is an approximation and may not reflect exact progress."
+    Write-Host "Found $($TotalFiles.ToString('N0')) files (counted in $($countDuration.ToString('hh\:mm\:ss'))). Starting backup..." -ForegroundColor Cyan
+    Write-Host "Note: the progress bar is an approximation and may not reflect exact progress." -ForegroundColor DarkGray
     Write-Host ""
 
     # File line detection regex (language-independent):
@@ -428,7 +428,7 @@ if ($ShowProgress) {
         $bar = ([char]0x2588).ToString() * $filled + ([char]0x2591).ToString() * $empty
         $countFmt = $count.ToString('N0')
         $totalFmt = $TotalFiles.ToString('N0')
-        Write-Host "`r[$bar] $pct% ($countFmt / $totalFmt files)" -NoNewline
+        Write-Host "`r[$bar] $pct% ($countFmt / $totalFmt files)" -NoNewline -ForegroundColor Green
     }
     Write-Host ""
     $RoboExit = $LASTEXITCODE
@@ -460,23 +460,23 @@ $copyDuration = $copyEnd - $copyStart
 # A fixed count works here because this layout is constant across locales and flags.
 Write-Host ""
 Write-Host ""
-Write-Host "-----------------------------------------------------------------"
-Write-Host "   ROBOCOPY SUMMARY"
-Write-Host "-----------------------------------------------------------------"
+Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
+Write-Host "   ROBOCOPY SUMMARY" -ForegroundColor Cyan
+Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
 Get-Content $LogRobo | Select-Object -Last 8
-Write-Host "-----------------------------------------------------------------"
-Write-Host "   Copy duration: $($copyDuration.ToString('hh\:mm\:ss'))"
-Write-Host "-----------------------------------------------------------------"
+Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
+Write-Host "   Copy duration: $($copyDuration.ToString('hh\:mm\:ss'))" -ForegroundColor Cyan
+Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
 
 # --- 8. SUMMARY GENERATION (DESTINATION) ---
 
 # Check for robocopy errors (exit code 8+ means errors occurred)
 if ($RoboExit -ge 8) {
     Write-Host ""
-    Write-Host "================================================================="
-    Write-Host "   [ERROR] ROBOCOPY REPORTED ERRORS (exit code: $RoboExit)"
-    Write-Host "   Check `"$LogRobo`" for details."
-    Write-Host "================================================================="
+    Write-Host "=================================================================" -ForegroundColor DarkGray
+    Write-Host "   [ERROR] ROBOCOPY REPORTED ERRORS (exit code: $RoboExit)" -ForegroundColor Red
+    Write-Host "   Check `"$LogRobo`" for details." -ForegroundColor Red
+    Write-Host "=================================================================" -ForegroundColor DarkGray
 
     $countSummary = if ($null -eq $countDuration) { "not performed" } else { $countDuration.ToString('hh\:mm\:ss') }
     $summaryLines = @(
@@ -533,7 +533,7 @@ if ($errors) {
 
 Write-Host ""
 Write-Host ""
-Write-Host "Updating smart history on the source drive..."
+Write-Host "Updating smart history on the source drive..." -ForegroundColor Cyan
 
 # Read existing history, update the current drive entry, sort and tag NEWEST/OLDEST.
 $data = @{}
@@ -563,10 +563,10 @@ $data.GetEnumerator() | Sort-Object Name | ForEach-Object {
 $outputLines | Out-File -FilePath $History -Encoding UTF8
 
 Write-Host ""
-Write-Host "================================================================="
-Write-Host "   BACKUP COMPLETED SUCCESSFULLY"
-Write-Host "   $SourceLabel ($Source) -> $DestLabel ($Dest)"
-Write-Host "================================================================="
+Write-Host "=================================================================" -ForegroundColor DarkGray
+Write-Host "   BACKUP COMPLETED SUCCESSFULLY" -ForegroundColor Green
+Write-Host "   $SourceLabel ($Source) -> $DestLabel ($Dest)" -ForegroundColor Green
+Write-Host "=================================================================" -ForegroundColor DarkGray
 Write-Host ""
 
 # --- 10. OPTIONAL VERIFICATION ---
@@ -595,7 +595,7 @@ if ($VerifyMode -eq "ask") {
 }
 
 Write-Host ""
-Write-Host "Verifying backup integrity..."
+Write-Host "Verifying backup integrity..." -ForegroundColor Cyan
 Write-Host ""
 
 # Run Robocopy in verification mode to compare source and destination.
@@ -647,25 +647,25 @@ $extraCount = if ($VerifyExit -eq 2) { (Select-String -Path $LogVerify -Pattern 
 $verifyPassed = ($VerifyExit -eq 0) -or ($VerifyExit -eq 2 -and $extraCount -eq 0)
 
 if ($verifyPassed) {
-    Write-Host "================================================================="
-    Write-Host "   VERIFICATION PASSED: Backup is an exact match of the source."
-    Write-Host "================================================================="
-    Write-Host "   Verification duration: $($verifyDuration.ToString('hh\:mm\:ss'))"
-    Write-Host "================================================================="
+    Write-Host "=================================================================" -ForegroundColor DarkGray
+    Write-Host "   VERIFICATION PASSED: Backup is an exact match of the source." -ForegroundColor Green
+    Write-Host "=================================================================" -ForegroundColor DarkGray
+    Write-Host "   Verification duration: $($verifyDuration.ToString('hh\:mm\:ss'))" -ForegroundColor Green
+    Write-Host "=================================================================" -ForegroundColor DarkGray
     Add-Content -Path $LogSummary -Value "`nVerification: PASSED`nVerification duration: $($verifyDuration.ToString('hh\:mm\:ss'))" -Encoding UTF8
 
     # Write timing entry to source rolling log
     Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $verifyDuration -Flags $flagsStr -Status "OK"
 } else {
-    Write-Host "================================================================="
-    Write-Host "   VERIFICATION WARNING: Differences found."
-    Write-Host "   Check `"$LogVerify`" for details."
-    Write-Host "================================================================="
+    Write-Host "=================================================================" -ForegroundColor DarkGray
+    Write-Host "   VERIFICATION WARNING: Differences found." -ForegroundColor Yellow
+    Write-Host "   Check `"$LogVerify`" for details." -ForegroundColor Yellow
+    Write-Host "=================================================================" -ForegroundColor DarkGray
     Write-Host ""
     Get-Content $LogVerify | Select-Object -Last 8
     Write-Host ""
-    Write-Host "   Verification duration: $($verifyDuration.ToString('hh\:mm\:ss'))"
-    Write-Host "================================================================="
+    Write-Host "   Verification duration: $($verifyDuration.ToString('hh\:mm\:ss'))" -ForegroundColor Yellow
+    Write-Host "=================================================================" -ForegroundColor DarkGray
     Add-Content -Path $LogSummary -Value "`nVerification: Differences found. See `"verify_log.txt`".`nVerification duration: $($verifyDuration.ToString('hh\:mm\:ss'))" -Encoding UTF8
 
     # Write timing entry to source rolling log
