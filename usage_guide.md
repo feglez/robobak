@@ -120,15 +120,15 @@ It **never copies or deletes anything**, runs no Robocopy, and doesn't check the
 1. **Validates parameters** — checks that both drive letters are provided and that they are different
 2. **Checks drive availability** — verifies both drives are physically connected
 3. **Checks volume labels** — reads both drive labels (tries `Get-Volume` first, falls back to `[System.IO.DriveInfo]` for drives that don't expose their label through CIM, such as VeraCrypt-mounted volumes). If the source label is still blank, warns the user and lets them choose to continue or cancel. Then verifies the destination label starts with `BACKUP_` to prevent accidents
-4. **Previews the changes (dry run)** — runs Robocopy in list-only mode (`/L`) with the same `/MIR` and the same exclusions as the real copy, to count the files it would delete and copy. Nothing is modified on either drive: the dry run's log and list are written to `%TEMP%` and only moved to the destination after you confirm (step 7), or deleted if you cancel. It runs without `/MT`, because with several threads Robocopy's lines can get mixed up, which the list can't tolerate. The counts are read **by position** from Robocopy's summary table (its labels are translated into your Windows language, but its layout isn't), and deletions are the lines tagged `EXTRA` (a Robocopy constant, never translated). Files inside a folder that will be deleted are counted and listed one by one. The dry run walks both drives like the verification does, but with a single thread, so it may take longer than a verification. Its duration is shown on screen and saved in `backup_summary.txt` and `backup_times.txt`
-5. **Asks for confirmation** — displays source and destination drives with their labels, then the dry run's counts, for example `Will delete 1.240 files (3,2 GB) and copy 37 files (412,0 MB).` Type `L` to open the list in Notepad (deletions first, then copies; the screen then asks again), `Y` to proceed, or anything else to cancel. **Above 500 files or 5 GB to delete**, the counts are shown inside a loud red warning: check the list, and if files are missing from the source by mistake, cancel and restore them first. The thresholds can be changed in `local\settings.json` (see [Settings](#settings)). If the dry run itself reported errors (Robocopy exit code 8 or more), the screen says so and the counts may be incomplete. If its summary table can't be read, the screen says the counts are unknown
+4. **Previews the changes (dry run)** — runs Robocopy in list-only mode (`/L`) with the same `/MIR` and the same exclusions as the real copy, to count the files it would delete and copy. Nothing is modified on either drive: the dry run's log and list are written to `%TEMP%` and only moved to the destination after you confirm (step 7), or deleted if you cancel. It runs without `/MT`, because with several threads Robocopy's lines can get mixed up, which the list can't tolerate. The counts are read **by position** from Robocopy's summary table (its labels are translated into your Windows language, but its layout isn't), and deletions are the lines tagged `EXTRA` (a Robocopy constant, never translated). Files inside a folder that will be deleted are counted and listed one by one. The dry run walks both drives like the verification does, but with a single thread, so it may take longer than a verification. Its duration is shown on screen and saved in `backup_summary.txt` and `backup_times.txt`. Before it starts, the screen shows how long the last dry run to the same drive took (see [Time estimates](#time-estimates))
+5. **Asks for confirmation** — displays source and destination drives with their labels, then the dry run's counts, for example `Will delete 1.240 files (3,2 GB) and copy 37 files (412,0 MB).` Type `L` to open the list in Notepad (deletions first, then copies; the screen then asks again), `Y` to proceed, or anything else to cancel. **Above 500 files or 5 GB to delete**, the counts are shown inside a loud red warning: check the list, and if files are missing from the source by mistake, cancel and restore them first. The thresholds can be changed in `local\settings.json` (see [Settings](#settings)). If the dry run itself reported errors (Robocopy exit code 8 or more), the screen says so and the counts may be incomplete. If its summary table can't be read, the screen says the counts are unknown. Under the counts, the screen estimates how long the copy will take, for example `Estimated copy time: about 2 min (412,0 MB at 52,7 MB/s, measured on the last large copy to BACKUP_1)` (see [Time estimates](#time-estimates))
 6. **Checks disk space** — compares the source's used space against the destination's total size. If the source is larger, warns the user that the backup will be incomplete and lets them choose to continue or cancel. The comparison uses total size (not free space) because `/MIR` deletes extras on the destination during the copy, freeing space
 7. **Prepares log folders** — ensures the source `backup_logs\` folder exists. Deletes and recreates the destination `current_backup_logs\` folder to clear any stale logs from a previous run (prevents inconsistent state if the backup fails). Then moves the dry run's list and log into it, as `dry_run_list.txt` and `dry_run_log.txt`
 8. **Runs Robocopy in mirror mode** — copies all files from source to destination; files on the destination that don't exist on the source are **deleted**. By default the terminal stays clean (individual files are only logged to `robocopy_log.txt`). With `--show-progress`, files are counted first (the counting time is logged separately), then a progress bar is displayed. With `--verbose`, every file operation is printed to the terminal. A summary table and the copy duration are displayed at the end in all modes
 9. **Writes a summary** — saves a `backup_summary.txt` on the destination with the status (success or failure), date, source/destination info, Robocopy exit code, the dry run's counts and duration, file count duration, copy duration, flags used, and any errors found in the log. If Robocopy reported critical errors (exit code 8+), the script stops after writing the summary, updating the timing log and recording the run (step 13)
 10. **Updates the backup history** — maintains a `backup_history.txt` on the source drive tracking all backup disks, marking the `[NEWEST]` and `[OLDEST]` entries
-11. **Optional verification** — asks if you want to verify the backup. If accepted, runs robocopy in list-only mode (`/L`) with multithreading (`/MT:16`) and retry limits (`/R:3 /W:5`) to compare source and destination without modifying anything. The `current_backup_logs` folder (destination-only, written after the copy) and `backup_logs` folder (on both source and destination — updated on the source after the copy, and its destination copy must also be excluded since `/XD` matches exact paths) are excluded from the comparison to avoid false differences. Note: `/XD` prevents excluded directories from being logged and compared at the file level, but robocopy still counts them as "EXTRA" in its stats table, which makes the exit code non-zero (2) even when the backup is a perfect match. To work around this, verification is considered successful when either the exit code is 0 or the exit code is 2 with no actual `EXTRA` lines in the log (case-sensitive — `EXTRA` is a robocopy constant, not translated). Reports whether the backup is a perfect match or if differences were found. The result and verification duration are appended to `backup_summary.txt`
-12. **Updates timing log** — writes a timing entry to `backup_times.txt` on the source drive with the dry run duration, file count duration (if `--show-progress` was used), copy duration, verification duration, and flags used
+11. **Optional verification** — asks if you want to verify the backup. If accepted, runs robocopy in list-only mode (`/L`) with multithreading (`/MT:16`) and retry limits (`/R:3 /W:5`) to compare source and destination without modifying anything. The `current_backup_logs` folder (destination-only, written after the copy) and `backup_logs` folder (on both source and destination — updated on the source after the copy, and its destination copy must also be excluded since `/XD` matches exact paths) are excluded from the comparison to avoid false differences. Note: `/XD` prevents excluded directories from being logged and compared at the file level, but robocopy still counts them as "EXTRA" in its stats table, which makes the exit code non-zero (2) even when the backup is a perfect match. To work around this, verification is considered successful when either the exit code is 0 or the exit code is 2 with no actual `EXTRA` lines in the log (case-sensitive — `EXTRA` is a robocopy constant, not translated). Reports whether the backup is a perfect match or if differences were found. The result and verification duration are appended to `backup_summary.txt`. How long the last verification to the same drive took is shown just before the question, or under "Verifying backup integrity..." with `--verify`
+12. **Updates timing log** — writes a timing entry to `backup_times.txt` on the source drive with the dry run duration, file count duration (if `--show-progress` was used), copy duration, the size the dry run said would be copied, verification duration, and flags used. The next runs read these to estimate their times
 13. **Records the run** — appends one line to `local\runs.csv`, next to the script, with the date, both labels, the result (`ok` or `failed`) and the verification result. This happens once at the end of **every run that ran the copy**: a failed copy, a run without verification, a verified run, and a run whose verification found differences. A run cancelled at a prompt, or refused before the copy, writes nothing. If the line can't be written (for example, the file is open in Excel), a yellow warning says so and the run still ends normally. See [Script folder](#script-folder-local)
 
 ## Generated files
@@ -140,7 +140,7 @@ All log files are organized into dedicated folders instead of the drive root.
 | File | Description |
 |------|-------------|
 | `backup_history.txt` | List of all backup drives used, sorted by name, with `[NEWEST]` and `[OLDEST]` tags. Each drive label appears **only once** — if you back up to the same drive twice, its entry is updated with the latest date (not duplicated) |
-| `backup_times.txt` | Rolling log of the last 10 backups with timing information (file count duration, copy duration, verification duration, flags used). The **first entry is the oldest** and the **last entry is the newest**. When the 11th backup is added, the oldest entry is removed |
+| `backup_times.txt` | Rolling log of the last 10 backups with timing information (dry run duration, file count duration, copy duration, copied size, verification duration, flags used), which the [time estimates](#time-estimates) read. The **first entry is the oldest** and the **last entry is the newest**. When the 11th backup is added, the oldest entry is removed |
 
 ### Destination drive (`current_backup_logs\`)
 
@@ -209,6 +209,7 @@ Entries are ordered chronologically — oldest first, newest last:
   Dry run duration:      00:01:55
   File count duration:   00:01:30
   Copy duration:         01:23:45
+  Copied (dry run):      250.37 GB
   Verification duration: 00:02:10
   Flags:                 --show-progress
 
@@ -216,11 +217,12 @@ Entries are ordered chronologically — oldest first, newest last:
   Dry run duration:      00:02:05
   File count duration:   not performed
   Copy duration:         01:45:12
+  Copied (dry run):      312.80 GB
   Verification duration: not performed
   Flags:                 (none)
 ```
 
-Entries written before the dry run existed have no `Dry run duration` line. Both kinds are read and kept the same way.
+`Copied (dry run)` is the size the dry run said would be copied, always written with a point so it reads back on any system, or `unknown` if the dry run's counts couldn't be read. Entries written by older versions have no `Copied (dry run)` line, and the oldest ones no `Dry run duration` line either. All kinds are read and kept the same way.
 
 ### Example `backup_summary.txt`
 
@@ -272,6 +274,23 @@ Settings are optional and live in `local\settings.json`, in the folder that hold
 - **Invalid values** (negative numbers, text, broken JSON) are reported in yellow before the confirmation screen, and the defaults are used instead.
 - **`local\` is ignored by Git** (`.gitignore`), so it's never committed. Beware: `git clean -x` deletes ignored files, including `local\` (see [The local folder](#the-local-folder)).
 
+## Time estimates
+
+RoboBak reads how long past runs took from `backup_times.txt` on the source drive (and, to tell whether a drive is new, `backup_history.txt`), and shows:
+
+| When | Example | How it's worked out |
+|------|---------|---------------------|
+| Before the dry run | `Last time to BACKUP_1 it took 00:01:55.` | The last dry run from this source to the same drive. If there's none, the last one to another drive (`No previous dry run to BACKUP_2; to BACKUP_1 it took 00:01:55.`), or `First dry run from this drive: no previous time to compare.` |
+| On the confirmation screen | `Estimated copy time: about 2 h 35 min (462,8 GB at 52,7 MB/s, measured on the last large copy to BACKUP_1)` | This run's dry-run time, standing in for the time Robocopy spends going through the folders, plus the size to copy (from the dry run) divided by a speed. The speed comes from the most recent successful copy of 10 GB or more to the same drive: the size it copied divided by its copy time minus its dry-run time. If there's none, from such a copy to another drive (`measured on a copy to BACKUP_2`), and otherwise a default of 50 MB/s (`a default: no large copy measured yet`). If the destination isn't in `backup_history.txt`, the line starts with `First backup to BACKUP_1.` |
+| At the verification | `Last time to BACKUP_1 it took 00:02:10.` | The last verification to the same drive, or `First verification to BACKUP_1: no previous time.` Shown just before the verify question, or under "Verifying backup integrity..." with `--verify` |
+
+**Limits:**
+- **They're estimates.** The copy's time going through the folders is approximated by the dry run's, and the speed changes with file sizes: many small files copy more slowly than a few large ones.
+- **Copies under 10 GB don't measure the speed,** because going through the folders dominates their time.
+- **`backup_times.txt` keeps only the last 10 runs,** so after many small runs the last large copy drops out, and the estimate falls back to another drive's speed or to the default.
+- **Runs made by older versions** have no `Copied (dry run)` line, so they don't measure a speed either.
+- **On screen, numbers follow your Windows language settings** (the examples are from a Spanish system).
+
 ## Robocopy flags used
 
 | Flag | Meaning |
@@ -321,7 +340,7 @@ For most backup scenarios this is reliable and fast. If you need stricter detect
 
 - **Mirror mode deletes files.** Any file on the destination that does not exist on the source will be permanently removed. The destination becomes an exact copy of the source.
 - **`current_backup_logs\` is deleted and recreated on each run.** Previous logs (including `robocopy_log.txt`, `backup_summary.txt`, and `verify_log.txt`) are permanently removed before a new backup starts. This ensures no stale logs remain if the backup fails partway through.
-- **`backup_times.txt` keeps only the last 10 entries.** Older entries are automatically removed when the 11th is added.
+- **`backup_times.txt` keeps only the last 10 entries.** Older entries are automatically removed when the 11th is added, which also limits the [time estimates](#time-estimates).
 - **`backup_history.txt` is written after Robocopy finishes**, so the destination copy will be one backup behind until the next run.
 - **Do not disconnect drives during the backup.** This can cause incomplete copies or corrupted files.
 - **Do not run multiple backups of the same source drive at the same time.** The script does not prevent concurrent instances. Each backup writes to a separate destination drive, so the copy itself is safe, but the source log files (`backup_history.txt` and `backup_times.txt`) could be corrupted if two instances try to update them at the same time.

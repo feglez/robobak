@@ -11,6 +11,7 @@ A PowerShell script that creates exact mirror backups of one drive onto another 
 - **Progress bar** — optional real-time progress indicator during the copy
 - **Backup history** — tracks all backup drives on the source, marking the newest and oldest
 - **Timing log** — rolling log of the last 10 backups with durations
+- **Time estimates** — before the dry run and the verification, shows how long they took last time; the confirmation estimates the copy time from the amount to copy and the speed of past copies
 - **Backup records** — one line per mirror run in `local\runs.csv`, next to the script, with its result and verification
 - **System backup records** — `--system-done` records a system backup made with another program, so the records cover both kinds of backup
 - **Detailed logging** — full Robocopy report, summary with errors, and verification report on the destination
@@ -32,10 +33,11 @@ A PowerShell script that creates exact mirror backups of one drive onto another 
 
 Where `F` is the source drive and `E` is the destination.
 
-3. Read the confirmation screen. It says how many files the mirror will delete and copy:
+3. Read the confirmation screen. It says how many files the mirror will delete and copy, and estimates how long the copy will take:
 
 ```
 Will delete 1.240 files (3,2 GB) and copy 37 files (412,0 MB).
+Estimated copy time: about 2 min (412,0 MB at 52,7 MB/s, measured on the last large copy to BACKUP_1)
 Type L to see the list, Y to continue, anything else to cancel:
 ```
 
@@ -79,7 +81,7 @@ Records in `local\runs.csv` that a system backup (made with another program, suc
 | Location | File | Description |
 |----------|------|-------------|
 | Source `backup_logs\` | `backup_history.txt` | List of all backup drives with `[NEWEST]`/`[OLDEST]` tags |
-| Source `backup_logs\` | `backup_times.txt` | Rolling log of the last 10 backups with timing info |
+| Source `backup_logs\` | `backup_times.txt` | Rolling log of the last 10 backups with timing info, also used for the time estimates |
 | Dest `current_backup_logs\` | `robocopy_log.txt` | Full Robocopy technical report |
 | Dest `current_backup_logs\` | `backup_summary.txt` | Status, date, errors, timing, and verification result |
 | Dest `current_backup_logs\` | `verify_log.txt` | Verification comparison report (only if requested) |
