@@ -186,6 +186,29 @@ try {
     Assert-True ($null -eq (ConvertFrom-RoboStatsRow "   Tiempo:   0:00:00   0:00:00                       0:00:00   0:00:00")) "Times row is not mistaken for numbers"
     Assert-True ($null -eq (Read-RoboStats @("header", "-----------------------", "", "   just a file line"))) "missing table gives unknown counts"
 
+    # The end of a real copy's log: two "Speed" lines follow the table, which
+    # pushed the header, Dirs and Files rows out of the old "last 8 lines".
+    $realTail = @(
+        "------------------------------------------------------------------------------",
+        "",
+        "               Total   Copiado   OmitidoNo coincidencia     ERROR    Extras",
+        "Director.:     10376     10374      9773         0         0       312",
+        " Archivos:    194517      1667    192850         0         0       805",
+        "    Bytes: 462.836 g  42.082 g 420.754 g         0         0   4.982 g",
+        "   Tiempo:   2:39:58   0:15:06                       0:00:00   0:01:47",
+        "",
+        "",
+        "Velocidad:           49.822.023 Bytes/s",
+        "Velocidad:             2850,839 Megabytes/min",
+        "   Finalizado: viernes, 6 de noviembre de 2026 12:04:52",
+        ""
+    )
+    $shown = Get-RoboSummaryLines (@("header", "------------------------------------------------------------------------------", "file lines") + $realTail)
+    Assert-True ($shown[0] -match 'Total') "summary display starts at the column header"
+    Assert-Contains ($shown -join "`n") " Archivos:    194517" "summary display keeps the Files row when Speed lines follow"
+    Assert-Contains ($shown -join "`n") "Finalizado" "summary display keeps the lines after the table"
+    Assert-Equal 8 @(Get-RoboSummaryLines @(1..20 | ForEach-Object { "line $_" })).Count "without a line of dashes, the last 8 lines"
+
     # ------------------------------------------------------------------
     Write-Section "Sizes and thresholds"
 
@@ -313,6 +336,28 @@ try {
     $times = Get-Content -LiteralPath (Join-Path $fx.Src 'backup_logs\backup_times.txt') -Raw -Encoding UTF8
     Assert-Contains $times "  Dry run duration:      " "backup_times.txt has the dry-run duration"
     Assert-Equal ($tempBefore -join '|') ((Get-DryRunTempFiles) -join '|') "dry-run temp files moved away"
+
+    # ------------------------------------------------------------------
+    Write-Section "End to end (b3): the screen shows the whole summary table"
+
+    # A copy that takes measurable time makes robocopy print two "Speed" lines
+    # after its table (with the tiny fixture above it prints none). Robocopy
+    # doesn't always print them for a fast copy, so their presence is only
+    # reported; the unit test above checks that layout deterministically.
+    $bigRoot = Join-Path $TestRoot 'e2e_summary'
+    $bigSrc = Join-Path $bigRoot 'src'
+    $bigDst = Join-Path $bigRoot 'dst'
+    New-Item -ItemType Directory -Path $bigSrc, $bigDst -Force | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $bigSrc 'big.bin'), (New-Object byte[] (100MB)))
+    $out = Invoke-RoboBakTest "S=$bigSrc|DATA_T;D=$bigDst|BACKUP_T" @('S', 'D', '--no-verify') @('Y')
+    $roboLog = @(Get-Content -LiteralPath (Join-Path $bigDst 'current_backup_logs\robocopy_log.txt'))
+    $sep = Get-LastRoboSeparator $roboLog
+    $tableRows = @($roboLog[($sep + 1)..($roboLog.Count - 1)] | Where-Object { $_.Trim() })
+    Assert-True ($tableRows.Count -ge 5) "the copy's log has a summary table (header and 4 rows)"
+    Write-Host ("  INFO  robocopy printed {0} line(s) after the table this time" -f [math]::Max(0, $tableRows.Count - 5)) -ForegroundColor DarkGray
+    $screen = $out.Substring([math]::Max(0, $out.IndexOf('ROBOCOPY SUMMARY')))
+    $missing = @($tableRows | Where-Object { $screen.IndexOf($_) -lt 0 })
+    Assert-Equal 0 $missing.Count "the screen shows every row of the copy's summary table"
 
     # ------------------------------------------------------------------
     Write-Section "End to end (b2): second run with --verify"

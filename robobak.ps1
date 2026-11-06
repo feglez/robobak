@@ -582,15 +582,17 @@ $copyEnd = Get-Date
 $copyDuration = $copyEnd - $copyStart
 
 # Display the summary statistics from the log.
-# The stats table is always the last 8 lines: the "----" separator, a blank line,
-# the column header, 4 data rows (Dirs, Files, Bytes, Time), and the "Finished" timestamp.
-# A fixed count works here because this layout is constant across locales and flags.
+# Get-RoboSummaryLines (robobak-lib.ps1) returns everything after the log's last
+# "----" line: the column header, the Dirs, Files, Bytes and Times rows, and the
+# lines after them. A fixed number of lines doesn't work: a real copy adds two
+# "Speed" lines after the table, which pushed the header, Dirs and Files rows
+# out of the old "last 8 lines".
 Write-Host ""
 Write-Host ""
 Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
 Write-Host "   ROBOCOPY SUMMARY" -ForegroundColor Cyan
 Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
-Get-Content $LogRobo | Select-Object -Last 8
+Get-RoboSummaryLines (Get-Content $LogRobo)
 Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
 Write-Host "   Copy duration: $($copyDuration.ToString('hh\:mm\:ss'))" -ForegroundColor Cyan
 if ($RoboExit -lt 8) {
@@ -801,7 +803,7 @@ if ($verifyPassed) {
     Write-Host "   Check `"$LogVerify`" for details." -ForegroundColor Yellow
     Write-Host "=================================================================" -ForegroundColor DarkGray
     Write-Host ""
-    Get-Content $LogVerify | Select-Object -Last 8
+    Get-RoboSummaryLines (Get-Content $LogVerify)
     Write-Host ""
     Write-Host "   Verification duration: $($verifyDuration.ToString('hh\:mm\:ss'))" -ForegroundColor Yellow
     Write-Host "=================================================================" -ForegroundColor DarkGray

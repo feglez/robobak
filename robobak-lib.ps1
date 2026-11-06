@@ -201,15 +201,38 @@ function ConvertFrom-RoboStatsRow {
     return , $values
 }
 
+# Get-LastRoboSeparator: index of the last line of dashes in a robocopy log
+# (the one just above the summary table), or -1.
+function Get-LastRoboSeparator {
+    param([string[]]$Lines)
+    if (-not $Lines) { return -1 }
+    for ($i = $Lines.Count - 1; $i -ge 0; $i--) {
+        if ($Lines[$i] -match '^\s*-{10,}\s*$') { return $i }
+    }
+    return -1
+}
+
+# Get-RoboSummaryLines: the summary table at the end of a robocopy log, for the
+# screen: the lines after the last line of dashes, without the leading blank
+# lines, and at most 15 (the table and the lines after it are about 10).
+# Without a line of dashes, the last 8 lines.
+function Get-RoboSummaryLines {
+    param([string[]]$Lines)
+    if (-not $Lines) { return @() }
+    $sep = Get-LastRoboSeparator $Lines
+    if ($sep -lt 0) { return @($Lines | Select-Object -Last 8) }
+    $start = $sep + 1
+    while ($start -lt $Lines.Count -and -not $Lines[$start].Trim()) { $start++ }
+    if ($start -ge $Lines.Count) { return @() }
+    return @($Lines[$start..($Lines.Count - 1)] | Select-Object -First 15)
+}
+
 # Read-RoboStats: the Files and Bytes rows of the summary table, or $null if
 # the table is missing or doesn't have the expected layout.
 function Read-RoboStats {
     param([string[]]$Lines)
     if (-not $Lines) { return $null }
-    $sep = -1
-    for ($i = $Lines.Count - 1; $i -ge 0; $i--) {
-        if ($Lines[$i] -match '^\s*-{10,}\s*$') { $sep = $i; break }
-    }
+    $sep = Get-LastRoboSeparator $Lines
     if ($sep -lt 0) { return $null }
     # Skip blank lines, then: header, Dirs, Files, Bytes.
     $rows = @()
