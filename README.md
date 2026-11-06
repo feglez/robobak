@@ -11,6 +11,8 @@ A PowerShell script that creates exact mirror backups of one drive onto another 
 - **Progress bar** — optional real-time progress indicator during the copy
 - **Backup history** — tracks all backup drives on the source, marking the newest and oldest
 - **Timing log** — rolling log of the last 10 backups with durations
+- **Backup records** — one line per mirror run in `local\runs.csv`, next to the script, with its result and verification
+- **System backup records** — `--system-done` records a system backup made with another program, so the records cover both kinds of backup
 - **Detailed logging** — full Robocopy report, summary with errors, and verification report on the destination
 
 ## Requirements
@@ -64,6 +66,14 @@ Numbers follow your Windows language settings (the example is from a Spanish sys
 
 `--show-progress` and `--verbose` cannot be used together.
 
+### Recording a system backup
+
+```powershell
+.\robobak.ps1 --system-done S
+```
+
+Records in `local\runs.csv` that a system backup (made with another program, such as a disk imaging tool) was just written to the partition at `S:`. It asks for confirmation, never copies or deletes anything, and refuses a partition labeled `BACKUP_*`, because that's a mirror drive. See [Recording a system backup](usage_guide.md#recording-a-system-backup---system-done) in the usage guide.
+
 ## Generated files
 
 | Location | File | Description |
@@ -75,10 +85,11 @@ Numbers follow your Windows language settings (the example is from a Spanish sys
 | Dest `current_backup_logs\` | `verify_log.txt` | Verification comparison report (only if requested) |
 | Dest `current_backup_logs\` | `dry_run_list.txt` | What the dry run listed: files to delete, then files to copy |
 | Dest `current_backup_logs\` | `dry_run_log.txt` | Full Robocopy report of the dry run |
+| Script folder `local\` | `runs.csv` | One line per mirror run and per recorded system backup |
 
-## Settings
+## The `local\` folder
 
-Optional. The red warning's thresholds can be changed in `local\settings.json`, next to the script. RoboBak only reads this file and never creates it. The `local\` folder is ignored by Git, so `git clean -x` would delete it. See [Settings](usage_guide.md#settings) in the usage guide.
+`local\` sits next to the script and holds what only this computer knows: `runs.csv` (the backup records) and, optionally, `settings.json` (the red warning's thresholds, which RoboBak only reads and never creates). It's ignored by Git, so it's never committed, but `git clean -x` would delete it. To keep the records when you reinstall Windows or move to another computer, copy the whole folder and put it back next to the script. See [The local folder](usage_guide.md#the-local-folder) in the usage guide.
 
 ## Tests
 

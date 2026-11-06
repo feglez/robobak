@@ -99,6 +99,22 @@ Backs up showing every file operation on the terminal, then automatically verifi
 .\robobak.ps1 -h
 ```
 
+## Recording a system backup (`--system-done`)
+
+If you also make system backups (full images of the computer's disk) with another program, RoboBak can record them next to the mirror runs, so `local\runs.csv` shows when each kind of backup was last made:
+
+```
+.\robobak.ps1 --system-done S
+```
+
+Run it right after the system backup program has finished, where `S` is the partition that holds the system images. It:
+
+1. **Checks the letter** — the drive must be connected. A partition labeled `BACKUP_*` is **refused**: that label marks a mirror drive, and the system image partition never has one, so it most likely means the wrong letter was typed. The partition needs no particular label
+2. **Asks for confirmation** — shows the letter and label, and requires you to type `Y`
+3. **Records it** — appends one `system` line to `local\runs.csv` (see [Script folder](#script-folder-local)), with the computer's name as the source and the partition's label as the destination
+
+It **never copies or deletes anything**, runs no Robocopy, and doesn't check the backup itself: checking it is the backup program's job.
+
 ## What the script does (step by step)
 
 1. **Validates parameters** — checks that both drive letters are provided and that they are different
@@ -109,10 +125,11 @@ Backs up showing every file operation on the terminal, then automatically verifi
 6. **Checks disk space** — compares the source's used space against the destination's total size. If the source is larger, warns the user that the backup will be incomplete and lets them choose to continue or cancel. The comparison uses total size (not free space) because `/MIR` deletes extras on the destination during the copy, freeing space
 7. **Prepares log folders** — ensures the source `backup_logs\` folder exists. Deletes and recreates the destination `current_backup_logs\` folder to clear any stale logs from a previous run (prevents inconsistent state if the backup fails). Then moves the dry run's list and log into it, as `dry_run_list.txt` and `dry_run_log.txt`
 8. **Runs Robocopy in mirror mode** — copies all files from source to destination; files on the destination that don't exist on the source are **deleted**. By default the terminal stays clean (individual files are only logged to `robocopy_log.txt`). With `--show-progress`, files are counted first (the counting time is logged separately), then a progress bar is displayed. With `--verbose`, every file operation is printed to the terminal. A summary table and the copy duration are displayed at the end in all modes
-9. **Writes a summary** — saves a `backup_summary.txt` on the destination with the status (success or failure), date, source/destination info, Robocopy exit code, the dry run's counts and duration, file count duration, copy duration, flags used, and any errors found in the log. If Robocopy reported critical errors (exit code 8+), the script stops after writing the summary and updating the timing log
+9. **Writes a summary** — saves a `backup_summary.txt` on the destination with the status (success or failure), date, source/destination info, Robocopy exit code, the dry run's counts and duration, file count duration, copy duration, flags used, and any errors found in the log. If Robocopy reported critical errors (exit code 8+), the script stops after writing the summary, updating the timing log and recording the run (step 13)
 10. **Updates the backup history** — maintains a `backup_history.txt` on the source drive tracking all backup disks, marking the `[NEWEST]` and `[OLDEST]` entries
 11. **Optional verification** — asks if you want to verify the backup. If accepted, runs robocopy in list-only mode (`/L`) with multithreading (`/MT:16`) and retry limits (`/R:3 /W:5`) to compare source and destination without modifying anything. The `current_backup_logs` folder (destination-only, written after the copy) and `backup_logs` folder (on both source and destination — updated on the source after the copy, and its destination copy must also be excluded since `/XD` matches exact paths) are excluded from the comparison to avoid false differences. Note: `/XD` prevents excluded directories from being logged and compared at the file level, but robocopy still counts them as "EXTRA" in its stats table, which makes the exit code non-zero (2) even when the backup is a perfect match. To work around this, verification is considered successful when either the exit code is 0 or the exit code is 2 with no actual `EXTRA` lines in the log (case-sensitive — `EXTRA` is a robocopy constant, not translated). Reports whether the backup is a perfect match or if differences were found. The result and verification duration are appended to `backup_summary.txt`
 12. **Updates timing log** — writes a timing entry to `backup_times.txt` on the source drive with the dry run duration, file count duration (if `--show-progress` was used), copy duration, verification duration, and flags used
+13. **Records the run** — appends one line to `local\runs.csv`, next to the script, with the date, both labels, the result (`ok` or `failed`) and the verification result. This happens once at the end of **every run that ran the copy**: a failed copy, a run without verification, a verified run, and a run whose verification found differences. A run cancelled at a prompt, or refused before the copy, writes nothing. If the line can't be written (for example, the file is open in Excel), a yellow warning says so and the run still ends normally. See [Script folder](#script-folder-local)
 
 ## Generated files
 
@@ -134,6 +151,37 @@ All log files are organized into dedicated folders instead of the drive root.
 | `verify_log.txt` | Only created if verification is requested. Logs only the differences found between source and destination (since `/V` is not used during verification, identical files are not listed). If the backup is a perfect match, only the stats table appears |
 | `dry_run_list.txt` | The list shown by `L` at the confirmation: the dry run's counts, then every file the mirror would delete (folders deleted with their contents are marked `[folder]`, and their files follow), then every file it would copy (new or changed). UTF-8, so accented names display correctly |
 | `dry_run_log.txt` | Full Robocopy report of the dry run (list-only), converted to UTF-8. Robocopy writes it with `/UNILOG` so accented paths survive |
+
+### Script folder (`local\`)
+
+| File | Description |
+|------|-------------|
+| `runs.csv` | One line per backup: every mirror run that ran the copy (step 13) and every system backup recorded with `--system-done`. Lines are only ever appended, never rewritten. Created, with its header, the first time a line is written |
+| `settings.json` | Optional, written by you: the red warning's thresholds (see [Settings](#settings)). RoboBak never creates it |
+
+`runs.csv` columns:
+
+| Column | Values |
+|--------|--------|
+| `date` | Local time, `yyyy-MM-dd HH:mm:ss` |
+| `kind` | `mirror` or `system` |
+| `source` | The source drive's label. For a system backup, the computer's name |
+| `destination` | The destination drive's label, or the system image partition's label |
+| `result` | `ok` or `failed` (Robocopy exit code 8 or more) |
+| `verification` | `passed`, `differences` or `not performed`. Always `not performed` for a system backup |
+| `health` | `not checked` for now; reserved for a disk health result |
+
+The file is UTF-8 (with a byte order mark, so Excel and PowerShell read accents correctly). The header is plain, and every value is quoted, so labels with commas or quotes are kept intact. To read it in PowerShell: `Import-Csv .\local\runs.csv -Encoding UTF8`.
+
+### Example `runs.csv`
+
+```
+date,kind,source,destination,result,verification,health
+"2026-02-08 14:22:45","mirror","MY_DATA","BACKUP_2","ok","passed","not checked"
+"2026-02-09 09:15:30","mirror","MY_DATA","BACKUP_1","ok","not performed","not checked"
+"2026-02-09 10:02:11","system","LAPTOP","SYSIMG_1","ok","not performed","not checked"
+"2026-02-23 18:40:03","mirror","MY_DATA","BACKUP_2","failed","not performed","not checked"
+```
 
 ### Temporary files (`%TEMP%`)
 
@@ -194,6 +242,14 @@ Verification: PASSED
 Verification duration: 00:02:10
 ```
 
+## The local folder
+
+`local\` sits in the folder that holds the script and keeps what only this computer knows: the backup records (`runs.csv`) and, if you created it, `settings.json`. RoboBak creates the folder the first time it records a run.
+
+- **Ignored by Git** (`.gitignore`), so it's never committed or published. Beware: `git clean -x` deletes ignored files, including `local\`.
+- **Back it up before reinstalling Windows or moving to another computer:** copy the whole `local\` folder somewhere safe (an external drive, for example). After installing RoboBak again, put it back next to `robobak.ps1`. Without it, everything still works, but the records start from zero.
+- **A copy is enough:** the files are plain text, and nothing else on the computer refers to them.
+
 ## Settings
 
 Settings are optional and live in `local\settings.json`, in the folder that holds the script. The file has one section per program; RoboBak reads only its own, `robobak`:
@@ -214,7 +270,7 @@ Settings are optional and live in `local\settings.json`, in the folder that hold
 
 - **RoboBak only reads this file and never creates it.** A missing file, section or key means the default.
 - **Invalid values** (negative numbers, text, broken JSON) are reported in yellow before the confirmation screen, and the defaults are used instead.
-- **`local\` is ignored by Git** (`.gitignore`), so it's never committed. Beware: `git clean -x` deletes ignored files, including `local\`.
+- **`local\` is ignored by Git** (`.gitignore`), so it's never committed. Beware: `git clean -x` deletes ignored files, including `local\` (see [The local folder](#the-local-folder)).
 
 ## Robocopy flags used
 
@@ -301,6 +357,7 @@ Each check prints `PASS` or `FAIL`, and the script ends with `Passed: N  Failed:
 - **A real list-only robocopy** on test folders with every kind of difference: a changed file, new files, deleted files, a deleted folder with a nested folder, and accented names. The counts and the list must match exactly, and both folders must be left untouched.
 - **`robobak.ps1` end to end,** with the answers to its prompts piped in: cancelling leaves everything byte-identical, `L` then `Y` mirrors and keeps the dry run's files, a second run verifies, 501 deleted files trigger the red warning, and a wrong letter or label is refused before any robocopy runs.
 - **Behaviour kept from before the dry run existed:** for the default mode, `--show-progress` and `--verbose`, and for the verification, robocopy's echo of its own options (source, destination, excluded folders and flags) must match exactly what the original commands produce on an identical pair of folders. They also cover the verify question when no flag is given, the refusals (`--show-progress` with `--verbose`, the same letter twice), the help, the warning for a source without a label, and a failed copy (a locked file): `BACKUP FAILED`, the error in the summary, the failed entry in `backup_times.txt`, and no history update.
+- **Backup records:** one `runs.csv` line per run that ran the copy (verified, not verified, verify question answered N, failed), none for cancelled or refused runs, the header written once, the byte order mark, and labels with quotes, commas and accents surviving `Import-Csv`. `--system-done`: `Y` records one `system` line, `N` records nothing, an unmapped letter, a missing letter and a `BACKUP_` label are refused, and nothing is copied or changed on any folder. The tests check at the end that the repo's own `local\runs.csv` was never touched.
 
 **What they can't prove:** they use NTFS folders on the computer's own disk, not exFAT or VeraCrypt drives over USB, so the label fallback for VeraCrypt volumes, real timings and drive-specific behaviour still need a run on real drives.
 
@@ -313,7 +370,7 @@ F=C:\Temp\rb\src|DATA;E=C:\Temp\rb\dst|BACKUP_TEST;local=C:\Temp\rb\local
 ```
 
 - **`<letter>=<folder>|<label>`** is a fake drive. A letter that isn't in the map is an error, never a real drive.
-- **`local=<folder>`** replaces the `local\` folder. Without it, test mode uses the default settings and never reads the real `local\`.
+- **`local=<folder>`** replaces the `local\` folder, for both the settings and `runs.csv`. Without it, test mode uses the default settings, records nothing (it says so on screen), and never touches the real `local\`.
 - **Folders can't contain spaces,** because robocopy misreads a quoted path that ends in a backslash.
 - **While it's on,** the script shows a `TEST MODE` banner, and `L` prints the list's path instead of opening Notepad.
 
