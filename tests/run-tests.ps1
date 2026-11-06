@@ -415,6 +415,126 @@ try {
 
     Assert-Equal $dstBefore (Get-TreeSnapshot $fx.Dst) "destination unchanged after the refusals"
     Assert-Equal ($tempBefore -join '|') ((Get-DryRunTempFiles) -join '|') "no dry-run temp files left by the refusals"
+
+    # ------------------------------------------------------------------
+    Write-Section "End to end (e): behaviour kept from the original script"
+
+    # Get-RoboOptionsBlock: the part of a robocopy log that echoes the command
+    # (source, destination, file filter, excluded folders, options), between the
+    # 2nd and 3rd lines of dashes, without the start time, and with the test
+    # folder replaced by <ROOT>, so two runs on different folders compare.
+    function Get-RoboOptionsBlock {
+        param([string]$LogPath, [string]$Root)
+        $lines = [System.IO.File]::ReadAllLines($LogPath, [System.Text.Encoding]::Default)
+        $seps = @(for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*-{10,}\s*$') { $i } })
+        if ($seps.Count -lt 3) { return "(no options block in $LogPath)" }
+        $block = @($lines[($seps[1] + 1)..($seps[2] - 1)] | Where-Object { $_.Trim() } | Select-Object -Skip 1)
+        return (($block | ForEach-Object { $_.Replace($Root, '<ROOT>').TrimEnd() }) -join "`n")
+    }
+
+    # The original script's copy and verification commands (commit c99c724),
+    # unchanged, run directly on a twin fixture to get the reference logs.
+    function Invoke-OriginalCommands {
+        param($Fx, [string[]]$ModeFlags, [switch]$Verify)
+        $Source = $Fx.Src + '\'
+        $Dest = $Fx.Dst + '\'
+        $DestLogsDir = Join-Path $Dest 'current_backup_logs'
+        $SourceLogsDir = Join-Path $Source 'backup_logs'
+        $DestBackupLogsDir = Join-Path $Dest 'backup_logs'
+        New-Item -ItemType Directory -Path $DestLogsDir, $SourceLogsDir -Force | Out-Null
+        $LogRobo = Join-Path $DestLogsDir 'robocopy_log.txt'
+        $LogVerify = Join-Path $DestLogsDir 'verify_log.txt'
+        $RoboCommon = @(
+            "/MIR", "/MT:16", "/DCOPY:DAT", "/R:3", "/W:5", "/V",
+            "/LOG+:$LogRobo",
+            "/XD", '$RECYCLE.BIN', "System Volume Information", $DestLogsDir
+        )
+        & robocopy $Source $Dest @RoboCommon @ModeFlags > $null
+        if ($Verify) {
+            & robocopy $Source $Dest /MIR /L /MT:16 /R:3 /W:5 /LOG+:$LogVerify /XD '$RECYCLE.BIN' "System Volume Information" $DestLogsDir $SourceLogsDir $DestBackupLogsDir > $null
+        }
+        return @{ Copy = $LogRobo; Verify = $LogVerify }
+    }
+
+    $modes = @(
+        @{ Name = 'default mode';    Args = @();                  Flags = @() },
+        @{ Name = '--show-progress'; Args = @('--show-progress'); Flags = @('/TEE', '/NP') },
+        @{ Name = '--verbose';       Args = @('--verbose');       Flags = @('/TEE') }
+    )
+    foreach ($m in $modes) {
+        $tag = ($m.Name -replace '[^a-z]', '')
+        $fxNew = New-Fixture "e_$($tag)_new"
+        $fxOld = New-Fixture "e_$($tag)_orig"
+        $verifyArg = if ($m.Name -eq 'default mode') { '--verify' } else { '--no-verify' }
+        $out = Invoke-RoboBakTest "S=$($fxNew.Src)|DATA_T;D=$($fxNew.Dst)|BACKUP_T" (@('S', 'D') + $m.Args + @($verifyArg)) @('Y')
+        $ref = Invoke-OriginalCommands $fxOld $m.Flags -Verify:($verifyArg -eq '--verify')
+        Assert-Contains $out "BACKUP COMPLETED SUCCESSFULLY" "$($m.Name): mirror completed"
+        Assert-Equal (Get-FileSet $fxNew.Src) (Get-FileSet $fxNew.Dst) "$($m.Name): destination mirrors the source"
+        $newBlock = Get-RoboOptionsBlock (Join-Path $fxNew.Dst 'current_backup_logs\robocopy_log.txt') $fxNew.Root
+        $oldBlock = Get-RoboOptionsBlock $ref.Copy $fxOld.Root
+        Assert-Equal $oldBlock $newBlock "$($m.Name): the copy passes robocopy exactly the original options and exclusions"
+        Assert-Contains $out "1 Extra dir is expected" "$($m.Name): the expected-extra-dir note is still shown"
+        if ($verifyArg -eq '--verify') {
+            $newV = Get-RoboOptionsBlock (Join-Path $fxNew.Dst 'current_backup_logs\verify_log.txt') $fxNew.Root
+            $oldV = Get-RoboOptionsBlock $ref.Verify $fxOld.Root
+            Assert-Equal $oldV $newV "$($m.Name): the verification passes robocopy exactly the original options and exclusions"
+            Assert-Contains $out "VERIFICATION PASSED" "$($m.Name): verification passes (phantom extra dir still handled)"
+        }
+        if ($m.Name -eq '--show-progress') {
+            Assert-Contains $out "Counting files on source drive" "--show-progress: counts the files first"
+            Assert-True ($out -match '\] \d+% \(') "--show-progress: shows the progress bar"
+            $times = Get-Content -LiteralPath (Join-Path $fxNew.Src 'backup_logs\backup_times.txt') -Raw -Encoding UTF8
+            Assert-Contains $times "Flags:                 --show-progress" "--show-progress: the flag is logged in backup_times.txt"
+        }
+        if ($m.Name -eq '--verbose') {
+            Assert-Contains $out "new.txt" "--verbose: file operations are printed on the terminal"
+        }
+        $history = Get-Content -LiteralPath (Join-Path $fxNew.Src 'backup_logs\backup_history.txt') -Raw -Encoding UTF8
+        Assert-True ($history -match 'BACKUP_T \| \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \[NEWEST\]') "$($m.Name): backup_history.txt records the drive as NEWEST"
+    }
+
+    # No verify flag: RoboBak asks after the copy.
+    $fx = New-Fixture 'e_ask_no'
+    $out = Invoke-RoboBakTest "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T" @('S', 'D') @('Y', 'N')
+    $summary = Get-Content -LiteralPath (Join-Path $fx.Dst 'current_backup_logs\backup_summary.txt') -Raw -Encoding UTF8
+    Assert-Contains $summary "Verification: not performed" "no flag, answer N to the verify question: not verified"
+    $fx = New-Fixture 'e_ask_yes'
+    $out = Invoke-RoboBakTest "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T" @('S', 'D') @('Y', 'Y')
+    $summary = Get-Content -LiteralPath (Join-Path $fx.Dst 'current_backup_logs\backup_summary.txt') -Raw -Encoding UTF8
+    Assert-Contains $summary "Verification: PASSED" "no flag, answer Y to the verify question: verified"
+
+    # Refusals and warnings that come before the dry run.
+    $fx = New-Fixture 'e_refusals'
+    $dstBefore = Get-TreeSnapshot $fx.Dst
+    $out = Invoke-RoboBakTest "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T" @('S', 'D', '--show-progress', '--verbose') @('Y')
+    Assert-Contains $out "cannot be used together" "--show-progress with --verbose is refused"
+    $out = Invoke-RoboBakTest "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T" @('S', 'S') @('Y')
+    Assert-Contains $out "cannot be the same drive" "the same letter twice is refused"
+    $out = Invoke-RoboBakTest "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T" @('/?') @()
+    Assert-Contains $out "HELP: ROBOBAK" "/? shows the help"
+    $out = Invoke-RoboBakTest "S=$($fx.Src)|;D=$($fx.Dst)|BACKUP_T" @('S', 'D') @('N')
+    Assert-Contains $out "has no label" "a source without a label shows the warning"
+    Assert-NotContains $out "Checking what the mirror would change" "answering N to that warning stops before the dry run"
+    Assert-Equal $dstBefore (Get-TreeSnapshot $fx.Dst) "destination unchanged by these refusals"
+
+    # A copy error (exit code 8 or more): a source file locked by this test.
+    # Robocopy retries 3 times, 5 s apart, so this takes about 15 s.
+    $fx = New-Fixture 'e_failure'
+    $lock = [System.IO.File]::Open((Join-Path $fx.Src 'changed.txt'), 'Open', 'Read', 'None')
+    try {
+        $out = Invoke-RoboBakTest "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T" @('S', 'D', '--verify') @('Y')
+    } finally {
+        $lock.Close()
+    }
+    Assert-Contains $out "ROBOCOPY REPORTED ERRORS" "a locked file makes the copy report errors"
+    $summary = Get-Content -LiteralPath (Join-Path $fx.Dst 'current_backup_logs\backup_summary.txt') -Raw -Encoding UTF8
+    Assert-Contains $summary "STATUS: BACKUP FAILED" "failure: the summary says BACKUP FAILED"
+    Assert-True ($summary -match 'ERROR \d+') "failure: the summary lists the robocopy error"
+    Assert-Contains $summary "Dry run: would delete 6 files (" "failure: the summary still has the dry-run counts"
+    Assert-Contains $summary "Verification: not performed (backup failed)" "failure: no verification"
+    $times = Get-Content -LiteralPath (Join-Path $fx.Src 'backup_logs\backup_times.txt') -Raw -Encoding UTF8
+    Assert-Contains $times "(FAILED)" "failure: backup_times.txt records the failed run"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $fx.Src 'backup_logs\backup_history.txt'))) "failure: backup_history.txt is not updated"
 }
 catch {
     $script:Failed++
