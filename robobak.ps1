@@ -5,15 +5,45 @@
 # Force UTF-8 output for special characters
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+# Shared functions (drive resolution, settings, dry run). The library must sit
+# next to this script; loading it changes nothing on any drive.
+$LibPath = Join-Path $PSScriptRoot "robobak-lib.ps1"
+if (-not (Test-Path -LiteralPath $LibPath)) {
+    Write-Host "[ERROR] robobak-lib.ps1 was not found next to robobak.ps1 ($PSScriptRoot)." -ForegroundColor Red
+    Read-Host "Press Enter to continue..."
+    exit
+}
+. $LibPath
+
+# Test mode (used by tests\run-tests.ps1): while the ROBOBAK_TEST environment
+# variable is set, drive letters map to test folders and labels, and no real
+# drive is used. See robobak-lib.ps1 for the format.
+$TestMode = Test-RoboBakTestMode
+if ($TestMode) {
+    try {
+        $null = Get-RoboBakTestMap
+    } catch {
+        Write-Host "[ERROR] $($_.Exception.Message)" -ForegroundColor Red
+        Read-Host "Press Enter to continue..."
+        exit
+    }
+    Write-Host "=================================================================" -ForegroundColor Magenta
+    Write-Host "   TEST MODE: ROBOBAK_TEST is set" -ForegroundColor Magenta
+    Write-Host "   Drive letters map to test folders. No real drive is used." -ForegroundColor Magenta
+    Write-Host "=================================================================" -ForegroundColor Magenta
+}
+
 # --- HELPER FUNCTIONS ---
 
 # Update-TimesLog: Appends a timing entry to the rolling backup_times.txt on the source drive.
 # Keeps at most 10 entries (deletes the oldest when adding the 11th).
-# Each entry is a block of 5 lines separated by a blank line.
+# Each entry is a block of 6 lines separated by a blank line (entries written
+# before the dry run existed have 5 lines; both are read the same way).
 function Update-TimesLog {
     param(
         [string]$SrcLabel,
         [string]$DstLabel,
+        $DryRunDuration,  # TimeSpan
         $CountDuration,   # TimeSpan or $null (only with --show-progress)
         [TimeSpan]$CopyDuration,
         $VerifyDuration,  # TimeSpan or $null
@@ -21,11 +51,13 @@ function Update-TimesLog {
         [string]$Status
     )
 
+    $dryRunStr = if ($null -eq $DryRunDuration) { "not performed" } else { $DryRunDuration.ToString('hh\:mm\:ss') }
     $countStr  = if ($null -eq $CountDuration)  { "not performed" } else { $CountDuration.ToString('hh\:mm\:ss') }
     $verifyStr = if ($null -eq $VerifyDuration) { "not performed" } else { $VerifyDuration.ToString('hh\:mm\:ss') }
 
     $newEntry = @(
         "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $SrcLabel -> $DstLabel ($Status)"
+        "  Dry run duration:      $dryRunStr"
         "  File count duration:   $countStr"
         "  Copy duration:         $($CopyDuration.ToString('hh\:mm\:ss'))"
         "  Verification duration: $verifyStr"
@@ -94,6 +126,14 @@ function Show-Help {
     Write-Host "    - The Destination drive must have a volume label (name)"
     Write-Host "      starting with `"BACKUP_`" (e.g.: BACKUP_1)."
     Write-Host ""
+    Write-Host "   Before the copy:"
+    Write-Host "    - A list-only dry run (nothing is modified) counts the files"
+    Write-Host "      the mirror will delete and copy. At the confirmation, type"
+    Write-Host "      L to open the list, Y to continue, anything else to cancel."
+    Write-Host "    - Above 500 files or 5 GB to delete, the confirmation shows a"
+    Write-Host "      red warning. The thresholds can be changed in"
+    Write-Host "      `"local\settings.json`" (see usage_guide.md)."
+    Write-Host ""
     Write-Host "   Generated artifacts:"
     Write-Host "    1. On Source (backup_logs\):"
     Write-Host "       - `"backup_history.txt`" (List of all backup drives,"
@@ -106,6 +146,9 @@ function Show-Help {
     Write-Host "         errors, timing, and verification result)."
     Write-Host "       - `"verify_log.txt`" (Only if verification is"
     Write-Host "         requested. Logs differences found)."
+    Write-Host "       - `"dry_run_list.txt`" (What the mirror deleted and"
+    Write-Host "         copied, as listed by the dry run)."
+    Write-Host "       - `"dry_run_log.txt`" (Full robocopy dry-run report)."
     Write-Host ""
     Read-Host "Press Enter to continue..."
     exit
@@ -152,8 +195,16 @@ if ($SourceLetter -eq $DestLetter) {
     exit
 }
 
-$Source = "${SourceLetter}:\"
-$Dest = "${DestLetter}:\"
+$Source = Get-DriveRoot $SourceLetter
+$Dest = Get-DriveRoot $DestLetter
+
+# In test mode, a letter that isn't in ROBOBAK_TEST is an error: it must never
+# fall back to a real drive.
+if ($TestMode -and ($null -eq $Source -or $null -eq $Dest)) {
+    Write-Host "[ERROR] TEST MODE: drive letter not mapped in ROBOBAK_TEST (source: $SourceLetter, destination: $DestLetter)." -ForegroundColor Red
+    Read-Host "Press Enter to continue..."
+    exit
+}
 
 # Log folders and files
 $SourceLogsDir = Join-Path $Source "backup_logs"
@@ -180,20 +231,12 @@ if (-not (Test-Path $Dest)) {
 
 # --- 3. VOLUME LABEL CHECK ---
 
-# Get the volume labels (drive names).
-# Primary method: Get-Volume (CIM/WMI). -ErrorAction SilentlyContinue suppresses
-# the red error message it can produce if Windows hasn't finished updating volume
-# metadata (e.g., right after renaming a drive with admin privileges).
-# Fallback: [System.IO.DriveInfo] (.NET). Some volumes (e.g., VeraCrypt-mounted
-# drives) don't expose their label through CIM but do through .NET's DriveInfo.
-$SourceLabel = (Get-Volume -DriveLetter $SourceLetter -ErrorAction SilentlyContinue).FileSystemLabel
-if ([string]::IsNullOrEmpty($SourceLabel)) {
-    $SourceLabel = [System.IO.DriveInfo]::new("${SourceLetter}:").VolumeLabel
-}
-$DestLabel = (Get-Volume -DriveLetter $DestLetter -ErrorAction SilentlyContinue).FileSystemLabel
-if ([string]::IsNullOrEmpty($DestLabel)) {
-    $DestLabel = [System.IO.DriveInfo]::new("${DestLetter}:").VolumeLabel
-}
+# Get the volume labels (drive names). Get-DriveLabel (robobak-lib.ps1) tries
+# Get-Volume (CIM/WMI) first and falls back to [System.IO.DriveInfo] (.NET),
+# because some volumes (e.g., VeraCrypt-mounted drives) don't expose their label
+# through CIM but do through .NET's DriveInfo.
+$SourceLabel = Get-DriveLabel $SourceLetter
+$DestLabel = Get-DriveLabel $DestLetter
 
 # Warn if the source label is blank. After both Get-Volume and DriveInfo
 # fallback, this should only happen if the drive genuinely has no label
@@ -245,7 +288,43 @@ if ($DestLabel -notmatch '^BACKUP_') {
     exit
 }
 
-# --- 4. USER CONFIRMATION ---
+# --- 4. DRY RUN (LIST-ONLY PREVIEW) ---
+
+# Directories excluded from the copy. The dry run uses exactly the same list,
+# so its counts match what the real copy will do (see section 8 for the reason
+# behind each exclusion).
+$ExcludeDirs = @('$RECYCLE.BIN', "System Volume Information", $DestLogsDir)
+
+# Thresholds for the red "large deletion" warning, from local\settings.json
+# (section "robobak"), or the defaults (500 files, 5 GB) if it doesn't set them.
+$Settings = Read-RoboBakSettings (Get-RoboBakLocalDir $PSScriptRoot)
+if ($Settings.Warning) {
+    Write-Host ""
+    Write-Host "WARNING: $($Settings.Warning)" -ForegroundColor Yellow
+}
+
+# Run robocopy in list-only mode (/L) to count and list what the mirror would
+# delete and copy. Nothing may be written to either drive before the user
+# confirms, so the log and the list go to %TEMP% first. They are moved into the
+# destination's current_backup_logs\ after that folder is recreated (section 7),
+# or deleted if the user cancels.
+$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$DryRunTempLog  = Join-Path $env:TEMP "robobak_dry_run_log_$stamp.txt"
+$DryRunTempList = Join-Path $env:TEMP "robobak_dry_run_list_$stamp.txt"
+
+function Remove-DryRunTempFiles {
+    Remove-Item -LiteralPath $DryRunTempLog, $DryRunTempList -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host ""
+Write-Host "Checking what the mirror would change (list-only, nothing is modified)..." -ForegroundColor Cyan
+$DryRun = Invoke-RoboDryRun -Source $Source -Dest $Dest -ExcludeDirs $ExcludeDirs -LogPath $DryRunTempLog
+Write-DryRunList -DryRun $DryRun -Path $DryRunTempList -SourceText "$Source ($SourceLabel)" -DestText "$Dest ($DestLabel)"
+Write-Host "Dry run finished in $($DryRun.Duration.ToString('hh\:mm\:ss'))." -ForegroundColor Cyan
+$DryRunCounts = Format-DryRunCounts $DryRun.Stats
+$LargeDeletion = Test-LargeDeletion $DryRun.Stats $Settings
+
+# --- 5. USER CONFIRMATION ---
 
 Write-Host ""
 Write-Host ""
@@ -262,15 +341,48 @@ Write-Host "   Any file on $Dest ($DestLabel) that does NOT exist on $Source ($S
 Write-Host "   will be PERMANENTLY DELETED. $Dest ($DestLabel) will become an" -ForegroundColor Yellow
 Write-Host "   exact copy of $Source ($SourceLabel)." -ForegroundColor Yellow
 Write-Host ""
+if ($DryRun.ExitCode -ge 8) {
+    Write-Host "   WARNING: the dry run reported errors (robocopy exit code: $($DryRun.ExitCode))." -ForegroundColor Red
+    Write-Host "   The counts below may be incomplete. Type L to see the list." -ForegroundColor Red
+    Write-Host ""
+}
+if ($null -eq $DryRunCounts) {
+    Write-Host "   Could not read the dry run's summary: the counts are unknown." -ForegroundColor Yellow
+    Write-Host "   Type L to see the list." -ForegroundColor Yellow
+} elseif ($LargeDeletion) {
+    Write-Host "                                                                 " -BackgroundColor DarkRed
+    Write-Host "   !!! LARGE DELETION !!!                                        " -ForegroundColor White -BackgroundColor DarkRed
+    Write-Host ("   More than {0} files or {1} GB will be deleted from {2}" -f $Settings.DeleteWarnFiles.ToString('N0'), $Settings.DeleteWarnGB, $Dest) -ForegroundColor White -BackgroundColor DarkRed
+    Write-Host "   If files are missing from the source by mistake, cancel now  " -ForegroundColor White -BackgroundColor DarkRed
+    Write-Host "   and restore them first. Type L to check the list.            " -ForegroundColor White -BackgroundColor DarkRed
+    Write-Host "                                                                 " -BackgroundColor DarkRed
+    Write-Host ""
+    Write-Host "   Will $DryRunCounts." -ForegroundColor Red
+} else {
+    Write-Host "   Will $DryRunCounts." -ForegroundColor White
+}
+Write-Host ""
 Write-Host "=================================================================" -ForegroundColor DarkGray
-$Confirm = Read-Host "Type Y to confirm and continue, any other key to cancel"
+
+# L opens the list (deletions first, then copies) and asks again.
+while ($true) {
+    $Confirm = Read-Host "Type L to see the list, Y to continue, anything else to cancel"
+    if ($Confirm -ne 'L') { break }
+    if ($TestMode) {
+        Write-Host "   TEST MODE: the list is at $DryRunTempList" -ForegroundColor Magenta
+    } else {
+        Write-Host "   Opening the list in Notepad..." -ForegroundColor DarkGray
+        Start-Process notepad.exe -ArgumentList "`"$DryRunTempList`""
+    }
+}
 if ($Confirm -ne 'Y') {
+    Remove-DryRunTempFiles
     Write-Host "Operation cancelled by user." -ForegroundColor DarkYellow
     Read-Host "Press Enter to continue..."
     exit
 }
 
-# --- 5. DISK SPACE CHECK ---
+# --- 6. DISK SPACE CHECK ---
 
 # Compare source used space against destination total size to warn the user
 # before robocopy fails mid-copy with ERROR 112 (not enough space).
@@ -281,10 +393,10 @@ if ($Confirm -ne 'Y') {
 # directories are processed in parallel, so theoretically a large new file
 # could be written before extras in other directories are deleted, causing
 # a transient space shortage even if the final result would fit.
-# Uses [System.IO.DriveInfo] which works reliably with all volume types
-# including VeraCrypt-mounted drives.
-$SourceDrive = [System.IO.DriveInfo]::new("${SourceLetter}:")
-$DestDrive   = [System.IO.DriveInfo]::new("${DestLetter}:")
+# Get-DriveSpace (robobak-lib.ps1) uses [System.IO.DriveInfo], which works
+# reliably with all volume types including VeraCrypt-mounted drives.
+$SourceDrive = Get-DriveSpace $SourceLetter
+$DestDrive   = Get-DriveSpace $DestLetter
 $SourceUsed  = $SourceDrive.TotalSize - $SourceDrive.TotalFreeSpace
 $DestTotal   = $DestDrive.TotalSize
 
@@ -307,13 +419,14 @@ if ($SourceUsed -gt $DestTotal) {
     Write-Host "=================================================================" -ForegroundColor DarkGray
     $spaceChoice = Read-Host "Type Y to continue anyway (incomplete backup), any other key to cancel"
     if ($spaceChoice -ne 'Y') {
+        Remove-DryRunTempFiles
         Write-Host "Operation cancelled by user." -ForegroundColor DarkYellow
         Read-Host "Press Enter to continue..."
         exit
     }
 }
 
-# --- 6. PREPARE LOG FOLDERS ---
+# --- 7. PREPARE LOG FOLDERS ---
 
 # Ensure the source logs folder exists. On the very first backup, this creates an
 # empty backup_logs\ folder on the source. Robocopy will copy it to the destination
@@ -329,7 +442,21 @@ if (Test-Path $DestLogsDir) {
 }
 New-Item -Path $DestLogsDir -ItemType Directory -Force | Out-Null
 
-# --- 7. ROBOCOPY EXECUTION ---
+# Keep the dry run's list and log with this run's logs. The log is converted
+# from robocopy's UTF-16 (/UNILOG) to UTF-8 with a header line, like the other
+# logs; accented paths survive both encodings.
+$DryRunLog  = Join-Path $DestLogsDir "dry_run_log.txt"
+$DryRunList = Join-Path $DestLogsDir "dry_run_list.txt"
+# Copy, then delete: a move could fail if Notepad still has the list open.
+Copy-Item -LiteralPath $DryRunTempList -Destination $DryRunList -Force
+$dryRunLogLines = @("# Generated by RoboBak. Full robocopy output of the dry run (list-only, /L) made before the copy.")
+if (Test-Path -LiteralPath $DryRunTempLog) {
+    $dryRunLogLines += [System.IO.File]::ReadAllLines($DryRunTempLog, [System.Text.Encoding]::Unicode)
+}
+[System.IO.File]::WriteAllLines($DryRunLog, [string[]]$dryRunLogLines, (New-Object System.Text.UTF8Encoding($true)))
+Remove-DryRunTempFiles
+
+# --- 8. ROBOCOPY EXECUTION ---
 
 Write-Host ""
 Write-Host "Starting backup from $SourceLabel ($Source) to $DestLabel ($Dest)..." -ForegroundColor Cyan
@@ -355,7 +482,7 @@ $flagsStr = if ($flagsUsed.Count -gt 0) { $flagsUsed -join ", " } else { "(none)
 #   /V         Verbose: log all files including skipped ones
 #   /LOG+:file Append full output to robocopy_log.txt on the destination
 #              (append mode preserves the descriptive header written before the copy)
-#   /XD        Exclude directories:
+#   /XD        Exclude directories ($ExcludeDirs, the same list the dry run used):
 #              - $RECYCLE.BIN and System Volume Information: protected system folders
 #                that cannot be copied and would produce access-denied errors
 #              - $DestLogsDir (current_backup_logs): destination-only folder containing
@@ -365,8 +492,8 @@ $flagsStr = if ($flagsUsed.Count -gt 0) { $flagsUsed -join ", " } else { "(none)
 $RoboCommon = @(
     "/MIR", "/MT:16", "/DCOPY:DAT", "/R:3", "/W:5", "/V",
     "/LOG+:$LogRobo",
-    "/XD", '$RECYCLE.BIN', "System Volume Information", $DestLogsDir
-)
+    "/XD"
+) + $ExcludeDirs
 
 $countDuration = $null
 
@@ -471,7 +598,12 @@ if ($RoboExit -lt 8) {
 }
 Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
 
-# --- 8. SUMMARY GENERATION (DESTINATION) ---
+# --- 9. SUMMARY GENERATION (DESTINATION) ---
+
+# Dry-run lines shared by the failure and success summaries
+$dryRunSummary = if ($DryRunCounts) { "Dry run: would $DryRunCounts" } else { "Dry run: counts unknown (summary table not readable)" }
+if ($DryRun.ExitCode -ge 8) { $dryRunSummary += " - dry run reported errors (exit code $($DryRun.ExitCode))" }
+$dryRunDurationLine = "Dry run duration: $($DryRun.Duration.ToString('hh\:mm\:ss'))"
 
 # Check for robocopy errors (exit code 8+ means errors occurred)
 if ($RoboExit -ge 8) {
@@ -490,6 +622,8 @@ if ($RoboExit -ge 8) {
         "Source: $Source ($SourceLabel)"
         "Destination: $Dest ($DestLabel)"
         "Robocopy exit code: $RoboExit"
+        $dryRunSummary
+        $dryRunDurationLine
         "File count duration: $countSummary"
         "Copy duration: $($copyDuration.ToString('hh\:mm\:ss'))"
         "Flags: $flagsStr"
@@ -504,7 +638,7 @@ if ($RoboExit -ge 8) {
     $summaryLines | Set-Content -Path $LogSummary -Encoding UTF8
 
     # Write timing entry to source rolling log even on failure
-    Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $null -Flags $flagsStr -Status "FAILED"
+    Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -DryRunDuration $DryRun.Duration -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $null -Flags $flagsStr -Status "FAILED"
 
     Read-Host "Press Enter to continue..."
     exit
@@ -519,6 +653,8 @@ $summaryLines = @(
     "Source: $Source ($SourceLabel)"
     "Destination: $Dest ($DestLabel)"
     "Robocopy exit code: $RoboExit"
+    $dryRunSummary
+    $dryRunDurationLine
     "File count duration: $countSummary"
     "Copy duration: $($copyDuration.ToString('hh\:mm\:ss'))"
     "Flags: $flagsStr"
@@ -532,7 +668,7 @@ if ($errors) {
     $errorLines | Add-Content -Path $LogSummary -Encoding UTF8
 }
 
-# --- 9. HISTORY UPDATE (SOURCE) ---
+# --- 10. HISTORY UPDATE (SOURCE) ---
 
 Write-Host ""
 Write-Host ""
@@ -572,14 +708,14 @@ Write-Host "   $SourceLabel ($Source) -> $DestLabel ($Dest)" -ForegroundColor Gr
 Write-Host "=================================================================" -ForegroundColor DarkGray
 Write-Host ""
 
-# --- 10. OPTIONAL VERIFICATION ---
+# --- 11. OPTIONAL VERIFICATION ---
 
 if ($VerifyMode -eq "no") {
     # No verification - finalize summary and times log, then exit
     Add-Content -Path $LogSummary -Value "`nVerification: not performed" -Encoding UTF8
 
     # Write timing entry to source rolling log
-    Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $null -Flags $flagsStr -Status "OK"
+    Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -DryRunDuration $DryRun.Duration -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $null -Flags $flagsStr -Status "OK"
 
     Read-Host "Press Enter to continue..."
     exit
@@ -590,7 +726,7 @@ if ($VerifyMode -eq "ask") {
         Add-Content -Path $LogSummary -Value "`nVerification: not performed" -Encoding UTF8
 
         # Write timing entry to source rolling log
-        Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $null -Flags $flagsStr -Status "OK"
+        Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -DryRunDuration $DryRun.Duration -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $null -Flags $flagsStr -Status "OK"
 
         Read-Host "Press Enter to continue..."
         exit
@@ -613,7 +749,7 @@ Write-Host ""
 #   /XD    Exclude directories (full paths to avoid excluding user folders with the same name):
 #          - $RECYCLE.BIN, System Volume Information: same system folders as the backup
 #          - $DestLogsDir (current_backup_logs): destination-only folder with script-generated logs
-#          - $SourceLogsDir (backup_logs on source): updated AFTER the copy (step 9),
+#          - $SourceLogsDir (backup_logs on source): updated AFTER the copy (section 10),
 #            so its contents are newer on the source than the destination copy
 #          - backup_logs on destination: must also be excluded because /XD only matches
 #            exact paths - excluding the source path doesn't exclude the destination copy.
@@ -658,7 +794,7 @@ if ($verifyPassed) {
     Add-Content -Path $LogSummary -Value "`nVerification: PASSED`nVerification duration: $($verifyDuration.ToString('hh\:mm\:ss'))" -Encoding UTF8
 
     # Write timing entry to source rolling log
-    Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $verifyDuration -Flags $flagsStr -Status "OK"
+    Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -DryRunDuration $DryRun.Duration -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $verifyDuration -Flags $flagsStr -Status "OK"
 } else {
     Write-Host "=================================================================" -ForegroundColor DarkGray
     Write-Host "   VERIFICATION WARNING: Differences found." -ForegroundColor Yellow
@@ -672,7 +808,7 @@ if ($verifyPassed) {
     Add-Content -Path $LogSummary -Value "`nVerification: Differences found. See `"verify_log.txt`".`nVerification duration: $($verifyDuration.ToString('hh\:mm\:ss'))" -Encoding UTF8
 
     # Write timing entry to source rolling log
-    Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $verifyDuration -Flags $flagsStr -Status "OK (verify: differences)"
+    Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -DryRunDuration $DryRun.Duration -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $verifyDuration -Flags $flagsStr -Status "OK (verify: differences)"
 }
 Write-Host ""
 
