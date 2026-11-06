@@ -432,3 +432,180 @@ function Read-RunRecords {
     if (-not $path -or -not (Test-Path -LiteralPath $path)) { return @() }
     return @(Import-Csv -LiteralPath $path -Encoding UTF8)
 }
+
+# --- TIME ESTIMATES (backup_times.txt and backup_history.txt) ---
+
+# How long each step took before is read from the source drive's
+# backup_logs\backup_times.txt, which keeps the last 10 runs. Each entry starts
+# with "[yyyy-MM-dd HH:mm:ss] SOURCE -> DEST (STATUS)", followed by indented
+# "Key: value" lines. Older entries lack some lines (no "Dry run duration"
+# before the dry run existed, no "Copied (dry run)" before the estimates
+# existed): a missing line, "not performed" or "unknown" reads as $null.
+
+$script:DefaultCopySpeed = 50MB   # bytes per second when no large copy was measured
+$script:MinCopyForSpeed  = 10GB   # smaller copies don't measure the speed: listing the folders dominates them
+
+# ConvertFrom-TimesDuration: "hh:mm:ss" -> TimeSpan; anything else -> $null.
+function ConvertFrom-TimesDuration {
+    param([string]$Text)
+    if ($Text -match '^\s*(\d+):(\d{2}):(\d{2})\s*$') {
+        $h = [int]$Matches[1]; $m = [int]$Matches[2]; $s = [int]$Matches[3]
+        return [TimeSpan]::new($h, $m, $s)
+    }
+    return $null
+}
+
+# Format-TimesBytes: bytes as written in backup_times.txt ("462.84 GB",
+# invariant culture so it reads back on any system), or "unknown".
+function Format-TimesBytes {
+    param($Bytes)
+    if ($null -eq $Bytes) { return 'unknown' }
+    return [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:F2} GB', ($Bytes / 1GB))
+}
+
+# Read-TimesLogEntries: the entries of backup_times.txt, oldest first, as
+# objects: Date, Source, Dest, Status, DryRun, Copy, Verify (TimeSpan or $null)
+# and CopiedBytes (or $null). A missing or unreadable file gives no entries.
+function Read-TimesLogEntries {
+    param([string]$Path)
+    $entries = New-Object System.Collections.Generic.List[object]
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return @() }
+    $content = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    if (-not $content) { return @() }
+    foreach ($block in ($content.Trim() -split '(?:\r?\n){2,}')) {
+        $lines = @($block.Trim() -split '\r?\n')
+        if ($lines[0] -notmatch '^\[(?<date>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] (?<src>.*?) -> (?<dst>.*?) \((?<status>(?:OK|FAILED).*)\)$') { continue }
+        $date = [datetime]::ParseExact($Matches['date'], 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
+        $src = $Matches['src']; $dst = $Matches['dst']; $status = $Matches['status']
+        $values = @{}
+        foreach ($l in ($lines | Select-Object -Skip 1)) {
+            if ($l -match '^\s*(?<key>[^:]+):\s*(?<val>.*)$') { $values[$Matches['key'].Trim()] = $Matches['val'].Trim() }
+        }
+        $copied = $null
+        if ($values['Copied (dry run)'] -match '^(?<n>\d+(?:\.\d+)?) GB$') {
+            $copied = [int64]([double]::Parse($Matches['n'], [System.Globalization.CultureInfo]::InvariantCulture) * 1GB)
+        }
+        $entries.Add([pscustomobject]@{
+            Date        = $date
+            Source      = $src
+            Dest        = $dst
+            Status      = $status
+            DryRun      = ConvertFrom-TimesDuration $values['Dry run duration']
+            Copy        = ConvertFrom-TimesDuration $values['Copy duration']
+            Verify      = ConvertFrom-TimesDuration $values['Verification duration']
+            CopiedBytes = $copied
+        })
+    }
+    return $entries.ToArray()
+}
+
+# Read-HistoryLabels: every drive label in backup_history.txt (which keeps every
+# drive ever backed up to, unlike backup_times.txt). Empty if there is no file.
+function Read-HistoryLabels {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return @() }
+    return @(Get-Content -LiteralPath $Path -Encoding UTF8 | Where-Object { $_ -match ' \| ' } | ForEach-Object { ($_ -split ' \| ')[0].Trim() })
+}
+
+# Format-ApproxDuration: "less than a minute", "about N min" or "about H h M min".
+function Format-ApproxDuration {
+    param([TimeSpan]$Duration)
+    if ($Duration.TotalSeconds -lt 60) { return 'less than a minute' }
+    $minutes = [int][math]::Round($Duration.TotalMinutes)
+    if ($minutes -lt 60) { return "about $minutes min" }
+    $h = [int][math]::Floor($minutes / 60)
+    $m = $minutes % 60
+    if ($m -eq 0) { return "about $h h" }
+    return "about $h h $m min"
+}
+
+# Get-EntrySpeed: the copy speed (bytes per second) one past run measured, or
+# $null if it can't tell: only successful runs ("OK...") that copied at least
+# 10 GB count, and the dry run's time (an approximation of the time robocopy
+# spends listing the folders) is taken out of the copy's time.
+function Get-EntrySpeed {
+    param($Entry)
+    if ($Entry.Status -notmatch '^OK') { return $null }
+    if ($null -eq $Entry.CopiedBytes -or $Entry.CopiedBytes -lt $script:MinCopyForSpeed) { return $null }
+    if ($null -eq $Entry.Copy) { return $null }
+    $seconds = $Entry.Copy.TotalSeconds
+    if ($null -ne $Entry.DryRun) { $seconds -= $Entry.DryRun.TotalSeconds }
+    if ($seconds -le 0) { return $null }
+    return ($Entry.CopiedBytes / $seconds)
+}
+
+# Get-CopySpeed: the speed to estimate with, and where it comes from (Basis):
+# "pair" (the most recent large copy to the same drive), "source" (the most
+# recent large copy from the same source to another drive) or "default".
+function Get-CopySpeed {
+    param($Entries, [string]$Source, [string]$Dest)
+    $list = @($Entries)
+    for ($i = $list.Count - 1; $i -ge 0; $i--) {
+        $e = $list[$i]
+        if ($e.Source -eq $Source -and $e.Dest -eq $Dest) {
+            $s = Get-EntrySpeed $e
+            if ($s) { return [pscustomobject]@{ BytesPerSecond = $s; Basis = 'pair'; Dest = $Dest } }
+        }
+    }
+    for ($i = $list.Count - 1; $i -ge 0; $i--) {
+        $e = $list[$i]
+        if ($e.Source -eq $Source) {
+            $s = Get-EntrySpeed $e
+            if ($s) { return [pscustomobject]@{ BytesPerSecond = $s; Basis = 'source'; Dest = $e.Dest } }
+        }
+    }
+    return [pscustomobject]@{ BytesPerSecond = [double]$script:DefaultCopySpeed; Basis = 'default'; Dest = $null }
+}
+
+# Get-CopyEstimateText: the confirmation screen's estimate of the copy time:
+# this run's dry-run time (the listing) plus the bytes to copy at the speed
+# from Get-CopySpeed.
+function Get-CopyEstimateText {
+    param($Stats, [TimeSpan]$DryRunDuration, $Entries, [string]$Source, [string]$Dest, [bool]$FirstBackup)
+    $prefix = if ($FirstBackup) { "First backup to $Dest. " } else { '' }
+    if ($null -eq $Stats) {
+        return $prefix + "The copy time can't be estimated: the dry run's counts are unknown."
+    }
+    $speed = Get-CopySpeed $Entries $Source $Dest
+    $estimate = [TimeSpan]::FromSeconds($DryRunDuration.TotalSeconds + ($Stats.CopyBytes / $speed.BytesPerSecond))
+    $size = Format-Size $Stats.CopyBytes
+    $rate = ('{0:N1}' -f ($speed.BytesPerSecond / 1MB)) + ' MB/s'
+    switch ($speed.Basis) {
+        'pair'   { $basis = "$size at $rate, measured on the last large copy to $Dest" }
+        'source' { $basis = "$size at $rate, measured on a copy to $($speed.Dest)" }
+        default  { $basis = "$size at " + ('{0:N0}' -f ($speed.BytesPerSecond / 1MB)) + " MB/s, a default: no large copy measured yet" }
+    }
+    return "${prefix}Estimated copy time: $(Format-ApproxDuration $estimate) ($basis)"
+}
+
+# Get-DryRunHintText: how long the last dry run took, shown before it starts.
+function Get-DryRunHintText {
+    param($Entries, [string]$Source, [string]$Dest)
+    $list = @($Entries)
+    for ($i = $list.Count - 1; $i -ge 0; $i--) {
+        $e = $list[$i]
+        if ($e.Source -eq $Source -and $e.Dest -eq $Dest -and $null -ne $e.DryRun) {
+            return "Last time to $Dest it took $($e.DryRun.ToString('hh\:mm\:ss'))."
+        }
+    }
+    for ($i = $list.Count - 1; $i -ge 0; $i--) {
+        $e = $list[$i]
+        if ($e.Source -eq $Source -and $null -ne $e.DryRun) {
+            return "No previous dry run to $Dest; to $($e.Dest) it took $($e.DryRun.ToString('hh\:mm\:ss'))."
+        }
+    }
+    return "First dry run from this drive: no previous time to compare."
+}
+
+# Get-VerifyHintText: how long the last verification to the same drive took.
+function Get-VerifyHintText {
+    param($Entries, [string]$Source, [string]$Dest)
+    $list = @($Entries)
+    for ($i = $list.Count - 1; $i -ge 0; $i--) {
+        $e = $list[$i]
+        if ($e.Source -eq $Source -and $e.Dest -eq $Dest -and $null -ne $e.Verify) {
+            return "Last time to $Dest it took $($e.Verify.ToString('hh\:mm\:ss'))."
+        }
+    }
+    return "First verification to ${Dest}: no previous time."
+}
