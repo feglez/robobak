@@ -95,6 +95,59 @@ function Update-TimesLog {
     ($output -join "`n") | Set-Content -Path $TimesLog -Encoding UTF8 -NoNewline
 }
 
+# Write-RunRecord: appends one line to local\runs.csv (see robobak-lib.ps1) and
+# says so on screen. Returns $true if the line was written. A failure to write
+# it (e.g. the file is open in Excel) is reported in yellow but never stops the
+# run. In test mode without a "local=" folder, nothing is written.
+function Write-RunRecord {
+    param(
+        [string]$Kind,
+        [string]$Source,
+        [string]$Destination,
+        [string]$Result,
+        [string]$Verification
+    )
+    try {
+        $path = Add-RunRecord -LocalDir (Get-RoboBakLocalDir $PSScriptRoot) -Kind $Kind -Source $Source -Destination $Destination -Result $Result -Verification $Verification
+        if ($path) {
+            Write-Host "Recorded in `"$path`"." -ForegroundColor DarkGray
+            return $true
+        }
+        Write-Host "TEST MODE: no local= folder in ROBOBAK_TEST, so this run isn't recorded in runs.csv." -ForegroundColor Magenta
+        return $false
+    } catch {
+        Write-Host "WARNING: could not record this run in local\runs.csv: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+# Complete-MirrorRun: the end of every mirror run that ran the copy, whatever
+# happened (copy failed, verification skipped, passed or with differences).
+# Appends the verification result to the summary (if given), writes the timing
+# entry on the source, records the run in local\runs.csv, and waits for Enter.
+# It reads the run's variables ($SourceLabel, $DryRun, $copyDuration...) from
+# the script.
+function Complete-MirrorRun {
+    param(
+        [string]$Result,         # ok | failed
+        [string]$Verification,   # passed | differences | not performed
+        $VerifyDuration,         # TimeSpan or $null
+        [string]$TimesStatus,    # status shown in backup_times.txt
+        [string]$SummaryAppend   # text appended to backup_summary.txt, or empty
+    )
+    if ($SummaryAppend) {
+        Add-Content -Path $LogSummary -Value $SummaryAppend -Encoding UTF8
+    }
+
+    # Write timing entry to source rolling log
+    Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -DryRunDuration $DryRun.Duration -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $VerifyDuration -Flags $flagsStr -Status $TimesStatus
+
+    $null = Write-RunRecord -Kind 'mirror' -Source $SourceLabel -Destination $DestLabel -Result $Result -Verification $Verification
+
+    Read-Host "Press Enter to continue..."
+    exit
+}
+
 # --- 1. HELP AND PARAMETER VALIDATION ---
 
 function Show-Help {
@@ -113,6 +166,12 @@ function Show-Help {
     Write-Host "      --verbose        Show every file operation on the terminal (/TEE)"
     Write-Host ""
     Write-Host "   NOTE: --show-progress and --verbose cannot be used together."
+    Write-Host ""
+    Write-Host "   Recording a system backup (made with another program):"
+    Write-Host "      .\robobak.ps1 --system-done [Letter]"
+    Write-Host "      Records in local\runs.csv that a system backup was just"
+    Write-Host "      written to the partition at [Letter]. It never copies or"
+    Write-Host "      deletes anything. A partition labeled BACKUP_* is refused."
     Write-Host ""
     Write-Host "   Examples:"
     Write-Host "      .\robobak.ps1 F E"
@@ -149,6 +208,9 @@ function Show-Help {
     Write-Host "       - `"dry_run_list.txt`" (What the mirror deleted and"
     Write-Host "         copied, as listed by the dry run)."
     Write-Host "       - `"dry_run_log.txt`" (Full robocopy dry-run report)."
+    Write-Host "    3. Next to the script (local\, ignored by Git):"
+    Write-Host "       - `"runs.csv`" (One line per mirror run and per"
+    Write-Host "         recorded system backup)."
     Write-Host ""
     Read-Host "Press Enter to continue..."
     exit
@@ -158,6 +220,83 @@ function Show-Help {
 if ($args.Count -eq 0 -or $args[0] -eq '/?' -or $args[0] -eq '-h') {
     Show-Help
 }
+
+# --- SYSTEM BACKUP RECORD (--system-done) ---
+
+# .\robobak.ps1 --system-done <Letter>
+# Records, in local\runs.csv, that a system backup (made with another program)
+# was just written to the partition at <Letter>. It only records: it never
+# copies or deletes anything and runs no robocopy. The partition needs no
+# BACKUP_ label; a BACKUP_ label is refused, because the system image partition
+# never has one, so it most likely means the mirror drive's letter was typed.
+if (([string]$args[0]).ToLower() -eq '--system-done') {
+    $SysLetter = if ($args.Count -ge 2) { [string]$args[1] } else { '' }
+    if ($SysLetter -notmatch '^[A-Za-z]$') {
+        Write-Host "[ERROR] --system-done needs the drive letter of the system image partition (e.g.: .\robobak.ps1 --system-done S)." -ForegroundColor Red
+        Read-Host "Press Enter to continue..."
+        exit
+    }
+    $SysRoot = Get-DriveRoot $SysLetter
+    if ($TestMode -and $null -eq $SysRoot) {
+        Write-Host "[ERROR] TEST MODE: drive letter not mapped in ROBOBAK_TEST ($SysLetter)." -ForegroundColor Red
+        Read-Host "Press Enter to continue..."
+        exit
+    }
+    if (-not (Test-Path $SysRoot)) {
+        Write-Host "[ERROR] Drive $SysRoot is not available." -ForegroundColor Red
+        Read-Host "Press Enter to continue..."
+        exit
+    }
+    $SysLabel = Get-DriveLabel $SysLetter
+    $SysLabelText = if ([string]::IsNullOrEmpty($SysLabel)) { "no label" } else { $SysLabel }
+    if ($SysLabel -match '^BACKUP_') {
+        Write-Host ""
+        Write-Host "=================================================================" -ForegroundColor DarkGray
+        Write-Host "   SAFETY ERROR: NOT A SYSTEM IMAGE PARTITION" -ForegroundColor Red
+        Write-Host "=================================================================" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "   The drive at $SysRoot is named: `"$SysLabel`"" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "   A BACKUP_ label marks a mirror drive. The system image" -ForegroundColor Red
+        Write-Host "   partition never has one, so this is most likely the wrong" -ForegroundColor Red
+        Write-Host "   letter. Nothing was recorded." -ForegroundColor Red
+        Write-Host ""
+        Write-Host "=================================================================" -ForegroundColor DarkGray
+        Read-Host "Press Enter to continue..."
+        exit
+    }
+    Write-Host ""
+    Write-Host "=================================================================" -ForegroundColor DarkGray
+    Write-Host "                 RECORD A SYSTEM BACKUP" -ForegroundColor Cyan
+    Write-Host "=================================================================" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "   SYSTEM IMAGE PARTITION: $SysRoot  (Label: $SysLabelText)" -ForegroundColor White
+    Write-Host ""
+    Write-Host "   This only records that a system backup was just made there," -ForegroundColor White
+    Write-Host "   in local\runs.csv. Nothing is copied or deleted." -ForegroundColor White
+    Write-Host ""
+    Write-Host "=================================================================" -ForegroundColor DarkGray
+    $sysConfirm = Read-Host "Type Y to record a system backup on $SysRoot ($SysLabelText), anything else to cancel"
+    if ($sysConfirm -ne 'Y') {
+        Write-Host "Operation cancelled by user. Nothing was recorded." -ForegroundColor DarkYellow
+        Read-Host "Press Enter to continue..."
+        exit
+    }
+    $sysRecorded = Write-RunRecord -Kind 'system' -Source $env:COMPUTERNAME -Destination $SysLabel -Result 'ok' -Verification 'not performed'
+    Write-Host ""
+    Write-Host "=================================================================" -ForegroundColor DarkGray
+    if ($sysRecorded) {
+        Write-Host "   SYSTEM BACKUP RECORDED: $SysRoot ($SysLabelText)" -ForegroundColor Green
+        Write-Host "   $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Green
+    } else {
+        Write-Host "   SYSTEM BACKUP NOT RECORDED (see the message above)" -ForegroundColor Yellow
+    }
+    Write-Host "=================================================================" -ForegroundColor DarkGray
+    Write-Host ""
+    Read-Host "Press Enter to continue..."
+    exit
+}
+
 if ($args.Count -lt 2) {
     Show-Help
 }
@@ -639,11 +778,8 @@ if ($RoboExit -ge 8) {
     $summaryLines += @("", "Verification: not performed (backup failed)")
     $summaryLines | Set-Content -Path $LogSummary -Encoding UTF8
 
-    # Write timing entry to source rolling log even on failure
-    Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -DryRunDuration $DryRun.Duration -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $null -Flags $flagsStr -Status "FAILED"
-
-    Read-Host "Press Enter to continue..."
-    exit
+    # Timing entry and run record even on failure (the summary is complete)
+    Complete-MirrorRun -Result 'failed' -Verification 'not performed' -VerifyDuration $null -TimesStatus "FAILED"
 }
 
 $countSummary = if ($null -eq $countDuration) { "not performed" } else { $countDuration.ToString('hh\:mm\:ss') }
@@ -713,25 +849,13 @@ Write-Host ""
 # --- 11. OPTIONAL VERIFICATION ---
 
 if ($VerifyMode -eq "no") {
-    # No verification - finalize summary and times log, then exit
-    Add-Content -Path $LogSummary -Value "`nVerification: not performed" -Encoding UTF8
-
-    # Write timing entry to source rolling log
-    Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -DryRunDuration $DryRun.Duration -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $null -Flags $flagsStr -Status "OK"
-
-    Read-Host "Press Enter to continue..."
-    exit
+    # No verification - finalize summary, times log and run record, then exit
+    Complete-MirrorRun -Result 'ok' -Verification 'not performed' -VerifyDuration $null -TimesStatus "OK" -SummaryAppend "`nVerification: not performed"
 }
 if ($VerifyMode -eq "ask") {
     $verifyInput = Read-Host "Do you want to verify the backup matches the source? (Y/N)"
     if ($verifyInput -ne 'Y') {
-        Add-Content -Path $LogSummary -Value "`nVerification: not performed" -Encoding UTF8
-
-        # Write timing entry to source rolling log
-        Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -DryRunDuration $DryRun.Duration -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $null -Flags $flagsStr -Status "OK"
-
-        Read-Host "Press Enter to continue..."
-        exit
+        Complete-MirrorRun -Result 'ok' -Verification 'not performed' -VerifyDuration $null -TimesStatus "OK" -SummaryAppend "`nVerification: not performed"
     }
 }
 
@@ -793,10 +917,9 @@ if ($verifyPassed) {
     Write-Host "=================================================================" -ForegroundColor DarkGray
     Write-Host "   Verification duration: $($verifyDuration.ToString('hh\:mm\:ss'))" -ForegroundColor Green
     Write-Host "=================================================================" -ForegroundColor DarkGray
-    Add-Content -Path $LogSummary -Value "`nVerification: PASSED`nVerification duration: $($verifyDuration.ToString('hh\:mm\:ss'))" -Encoding UTF8
-
-    # Write timing entry to source rolling log
-    Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -DryRunDuration $DryRun.Duration -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $verifyDuration -Flags $flagsStr -Status "OK"
+    $verification  = 'passed'
+    $timesStatus   = "OK"
+    $summaryAppend = "`nVerification: PASSED`nVerification duration: $($verifyDuration.ToString('hh\:mm\:ss'))"
 } else {
     Write-Host "=================================================================" -ForegroundColor DarkGray
     Write-Host "   VERIFICATION WARNING: Differences found." -ForegroundColor Yellow
@@ -807,11 +930,10 @@ if ($verifyPassed) {
     Write-Host ""
     Write-Host "   Verification duration: $($verifyDuration.ToString('hh\:mm\:ss'))" -ForegroundColor Yellow
     Write-Host "=================================================================" -ForegroundColor DarkGray
-    Add-Content -Path $LogSummary -Value "`nVerification: Differences found. See `"verify_log.txt`".`nVerification duration: $($verifyDuration.ToString('hh\:mm\:ss'))" -Encoding UTF8
-
-    # Write timing entry to source rolling log
-    Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -DryRunDuration $DryRun.Duration -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $verifyDuration -Flags $flagsStr -Status "OK (verify: differences)"
+    $verification  = 'differences'
+    $timesStatus   = "OK (verify: differences)"
+    $summaryAppend = "`nVerification: Differences found. See `"verify_log.txt`".`nVerification duration: $($verifyDuration.ToString('hh\:mm\:ss'))"
 }
 Write-Host ""
 
-Read-Host "Press Enter to continue..."
+Complete-MirrorRun -Result 'ok' -Verification $verification -VerifyDuration $verifyDuration -TimesStatus $timesStatus -SummaryAppend $summaryAppend
