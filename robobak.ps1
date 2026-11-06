@@ -37,8 +37,10 @@ if ($TestMode) {
 
 # Update-TimesLog: Appends a timing entry to the rolling backup_times.txt on the source drive.
 # Keeps at most 10 entries (deletes the oldest when adding the 11th).
-# Each entry is a block of 6 lines separated by a blank line (entries written
-# before the dry run existed have 5 lines; both are read the same way).
+# Each entry is a block of 7 lines separated by a blank line. Older entries
+# have fewer lines (5 before the dry run existed, 6 before the time estimates
+# existed); they are all read the same way. Read-TimesLogEntries
+# (robobak-lib.ps1) reads the durations back for the time estimates.
 function Update-TimesLog {
     param(
         [string]$SrcLabel,
@@ -46,6 +48,7 @@ function Update-TimesLog {
         $DryRunDuration,  # TimeSpan
         $CountDuration,   # TimeSpan or $null (only with --show-progress)
         [TimeSpan]$CopyDuration,
+        $CopiedBytes,     # bytes the dry run said would be copied, or $null if unknown
         $VerifyDuration,  # TimeSpan or $null
         [string]$Flags,
         [string]$Status
@@ -60,6 +63,7 @@ function Update-TimesLog {
         "  Dry run duration:      $dryRunStr"
         "  File count duration:   $countStr"
         "  Copy duration:         $($CopyDuration.ToString('hh\:mm\:ss'))"
+        "  Copied (dry run):      $(Format-TimesBytes $CopiedBytes)"
         "  Verification duration: $verifyStr"
         "  Flags:                 $Flags"
     )
@@ -140,7 +144,8 @@ function Complete-MirrorRun {
     }
 
     # Write timing entry to source rolling log
-    Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -DryRunDuration $DryRun.Duration -CountDuration $countDuration -CopyDuration $copyDuration -VerifyDuration $VerifyDuration -Flags $flagsStr -Status $TimesStatus
+    $copiedBytes = if ($null -ne $DryRun.Stats) { $DryRun.Stats.CopyBytes } else { $null }
+    Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -DryRunDuration $DryRun.Duration -CountDuration $countDuration -CopyDuration $copyDuration -CopiedBytes $copiedBytes -VerifyDuration $VerifyDuration -Flags $flagsStr -Status $TimesStatus
 
     $null = Write-RunRecord -Kind 'mirror' -Source $SourceLabel -Destination $DestLabel -Result $Result -Verification $Verification
 
@@ -192,6 +197,9 @@ function Show-Help {
     Write-Host "    - Above 500 files or 5 GB to delete, the confirmation shows a"
     Write-Host "      red warning. The thresholds can be changed in"
     Write-Host "      `"local\settings.json`" (see usage_guide.md)."
+    Write-Host "    - The dry run and the verification show how long they took"
+    Write-Host "      last time, and the confirmation estimates the copy time,"
+    Write-Host "      from the timings kept in `"backup_times.txt`"."
     Write-Host ""
     Write-Host "   Generated artifacts:"
     Write-Host "    1. On Source (backup_logs\):"
@@ -455,13 +463,28 @@ function Remove-DryRunTempFiles {
     Remove-Item -LiteralPath $DryRunTempLog, $DryRunTempList -Force -ErrorAction SilentlyContinue
 }
 
+# Past timings, for the time estimates: backup_times.txt on the source keeps
+# the last 10 runs, and backup_history.txt every drive ever backed up to. Both
+# are read now, before this run updates them. A file that can't be read just
+# means no estimate from it.
+$TimesEntries = @()
+$FirstBackup = $true
+try {
+    $TimesEntries = @(Read-TimesLogEntries $TimesLog)
+    $FirstBackup = @(Read-HistoryLabels $History) -notcontains $DestLabel
+} catch {
+    Write-Host "WARNING: could not read the past timings on the source ($($_.Exception.Message)). No time estimates." -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host "Checking what the mirror would change (list-only, nothing is modified)..." -ForegroundColor Cyan
+Write-Host "   $(Get-DryRunHintText $TimesEntries $SourceLabel $DestLabel)" -ForegroundColor DarkGray
 $DryRun = Invoke-RoboDryRun -Source $Source -Dest $Dest -ExcludeDirs $ExcludeDirs -LogPath $DryRunTempLog
 Write-DryRunList -DryRun $DryRun -Path $DryRunTempList -SourceText "$Source ($SourceLabel)" -DestText "$Dest ($DestLabel)"
 Write-Host "Dry run finished in $($DryRun.Duration.ToString('hh\:mm\:ss'))." -ForegroundColor Cyan
 $DryRunCounts = Format-DryRunCounts $DryRun.Stats
 $LargeDeletion = Test-LargeDeletion $DryRun.Stats $Settings
+$CopyEstimate = Get-CopyEstimateText -Stats $DryRun.Stats -DryRunDuration $DryRun.Duration -Entries $TimesEntries -Source $SourceLabel -Dest $DestLabel -FirstBackup $FirstBackup
 
 # --- 5. USER CONFIRMATION ---
 
@@ -488,6 +511,7 @@ if ($DryRun.ExitCode -ge 8) {
 if ($null -eq $DryRunCounts) {
     Write-Host "   Could not read the dry run's summary: the counts are unknown." -ForegroundColor Yellow
     Write-Host "   Type L to see the list." -ForegroundColor Yellow
+    Write-Host "   $CopyEstimate" -ForegroundColor Yellow
 } elseif ($LargeDeletion) {
     Write-Host "                                                                 " -BackgroundColor DarkRed
     Write-Host "   !!! LARGE DELETION !!!                                        " -ForegroundColor White -BackgroundColor DarkRed
@@ -497,8 +521,10 @@ if ($null -eq $DryRunCounts) {
     Write-Host "                                                                 " -BackgroundColor DarkRed
     Write-Host ""
     Write-Host "   Will $DryRunCounts." -ForegroundColor Red
+    Write-Host "   $CopyEstimate" -ForegroundColor White
 } else {
     Write-Host "   Will $DryRunCounts." -ForegroundColor White
+    Write-Host "   $CopyEstimate" -ForegroundColor White
 }
 Write-Host ""
 Write-Host "=================================================================" -ForegroundColor DarkGray
@@ -852,7 +878,9 @@ if ($VerifyMode -eq "no") {
     # No verification - finalize summary, times log and run record, then exit
     Complete-MirrorRun -Result 'ok' -Verification 'not performed' -VerifyDuration $null -TimesStatus "OK" -SummaryAppend "`nVerification: not performed"
 }
+$VerifyHint = Get-VerifyHintText $TimesEntries $SourceLabel $DestLabel
 if ($VerifyMode -eq "ask") {
+    Write-Host "Verification: $VerifyHint" -ForegroundColor DarkGray
     $verifyInput = Read-Host "Do you want to verify the backup matches the source? (Y/N)"
     if ($verifyInput -ne 'Y') {
         Complete-MirrorRun -Result 'ok' -Verification 'not performed' -VerifyDuration $null -TimesStatus "OK" -SummaryAppend "`nVerification: not performed"
@@ -861,6 +889,9 @@ if ($VerifyMode -eq "ask") {
 
 Write-Host ""
 Write-Host "Verifying backup integrity..." -ForegroundColor Cyan
+if ($VerifyMode -eq "yes") {
+    Write-Host "   $VerifyHint" -ForegroundColor DarkGray
+}
 Write-Host ""
 
 # Run Robocopy in verification mode to compare source and destination.
