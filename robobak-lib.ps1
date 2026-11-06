@@ -356,3 +356,79 @@ function Write-DryRunList {
         $writer.Close()
     }
 }
+
+# --- RUN RECORDS (local\runs.csv) ---
+
+# One line per backup event, appended and never rewritten. RoboBak writes a
+# line at the end of every mirror run that ran the copy, and --system-done
+# writes one per system backup. The reminders window will read the file (and
+# add "skipped" lines). Columns:
+#   date          local time, yyyy-MM-dd HH:mm:ss
+#   kind          mirror | system
+#   source        source label (for a system backup: the computer's name)
+#   destination   destination label
+#   result        ok | failed | skipped
+#   verification  passed | differences | not performed
+#   health        not checked (until disk health exists) | ok | yellow | red | not approved
+# The header is written unquoted when the file is created; rows are quoted by
+# ConvertTo-Csv, so labels with commas, quotes or accents round-trip. UTF-8 with
+# a BOM, so PowerShell 5.1 and Excel read accents correctly.
+
+$script:RunsCsvHeader = 'date,kind,source,destination,result,verification,health'
+
+# Get-RunsCsvPath: local\runs.csv, or $null when there is no local folder
+# (test mode without "local=").
+function Get-RunsCsvPath {
+    param([string]$LocalDir)
+    if (-not $LocalDir) { return $null }
+    return (Join-Path $LocalDir 'runs.csv')
+}
+
+# Add-RunRecord: appends one line to local\runs.csv, creating the folder and the
+# file (with its header) if needed. Returns the file's path, or $null if there
+# is no local folder to write to.
+function Add-RunRecord {
+    param(
+        [string]$LocalDir,
+        [string]$Kind,
+        [string]$Source,
+        [string]$Destination,
+        [string]$Result,
+        [string]$Verification,
+        [string]$Health = 'not checked',
+        $Date = $null
+    )
+    $path = Get-RunsCsvPath $LocalDir
+    if (-not $path) { return $null }
+    if ($null -eq $Date) { $Date = Get-Date }
+    if (-not (Test-Path -LiteralPath $LocalDir)) {
+        New-Item -ItemType Directory -Path $LocalDir -Force | Out-Null
+    }
+    $record = [pscustomobject][ordered]@{
+        date         = $Date.ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
+        kind         = $Kind
+        source       = $Source
+        destination  = $Destination
+        result       = $Result
+        verification = $Verification
+        health       = $Health
+    }
+    # ConvertTo-Csv returns the quoted header, then the row: keep the row only.
+    $row = @($record | ConvertTo-Csv -NoTypeInformation)[1]
+    $isNew = (-not (Test-Path -LiteralPath $path)) -or ((Get-Item -LiteralPath $path).Length -eq 0)
+    if ($isNew) {
+        [System.IO.File]::WriteAllText($path, $script:RunsCsvHeader + "`r`n" + $row + "`r`n", (New-Object System.Text.UTF8Encoding($true)))
+    } else {
+        [System.IO.File]::AppendAllText($path, $row + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    }
+    return $path
+}
+
+# Read-RunRecords: every line of local\runs.csv as objects (empty if the file
+# doesn't exist).
+function Read-RunRecords {
+    param([string]$LocalDir)
+    $path = Get-RunsCsvPath $LocalDir
+    if (-not $path -or -not (Test-Path -LiteralPath $path)) { return @() }
+    return @(Import-Csv -LiteralPath $path -Encoding UTF8)
+}
