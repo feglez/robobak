@@ -62,6 +62,11 @@ New-Item -ItemType Directory -Path $TestRoot | Out-Null
 $SavedTestEnv = $env:ROBOBAK_TEST
 $env:ROBOBAK_TEST = $null
 
+# The repo's own local\runs.csv must never be touched by the tests: its state
+# is compared at the end.
+$RealRunsCsv = Join-Path $RepoRoot 'local\runs.csv'
+$RealRunsBefore = if (Test-Path -LiteralPath $RealRunsCsv) { (Get-FileHash -LiteralPath $RealRunsCsv).Hash } else { 'absent' }
+
 # Write-TestFile: a file of exactly $Size bytes with a given modification time.
 function Write-TestFile {
     param([string]$Path, [int]$Size, [datetime]$Time)
@@ -520,11 +525,17 @@ try {
     # A copy error (exit code 8 or more): a source file locked by this test.
     # Robocopy retries 3 times, 5 s apart, so this takes about 15 s.
     $fx = New-Fixture 'e_failure'
+    $failLocal = Join-Path $TestRoot 'e_failure_local'
     $lock = [System.IO.File]::Open((Join-Path $fx.Src 'changed.txt'), 'Open', 'Read', 'None')
     try {
-        $out = Invoke-RoboBakTest "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T" @('S', 'D', '--verify') @('Y')
+        $out = Invoke-RoboBakTest "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T;local=$failLocal" @('S', 'D', '--verify') @('Y')
     } finally {
         $lock.Close()
+    }
+    $failRecords = @(Read-RunRecords $failLocal)
+    Assert-Equal 1 $failRecords.Count "failure: the run is recorded once in runs.csv"
+    if ($failRecords.Count -ge 1) {
+        Assert-Equal 'mirror|failed|not performed' "$($failRecords[0].kind)|$($failRecords[0].result)|$($failRecords[0].verification)" "failure: recorded as a failed mirror, not verified"
     }
     Assert-Contains $out "ROBOCOPY REPORTED ERRORS" "a locked file makes the copy report errors"
     $summary = Get-Content -LiteralPath (Join-Path $fx.Dst 'current_backup_logs\backup_summary.txt') -Raw -Encoding UTF8
@@ -535,6 +546,138 @@ try {
     $times = Get-Content -LiteralPath (Join-Path $fx.Src 'backup_logs\backup_times.txt') -Raw -Encoding UTF8
     Assert-Contains $times "(FAILED)" "failure: backup_times.txt records the failed run"
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $fx.Src 'backup_logs\backup_history.txt'))) "failure: backup_history.txt is not updated"
+
+    # ------------------------------------------------------------------
+    Write-Section "Run records (local\runs.csv): the library"
+
+    $dateRx = '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$'
+    Assert-True ($null -eq (Add-RunRecord -LocalDir $null -Kind 'mirror' -Source 'A' -Destination 'BACKUP_B' -Result 'ok' -Verification 'passed')) "no local folder: nothing is written"
+    $unitLocal = Join-Path $TestRoot 'unit_local'
+    $unitPath = Add-RunRecord -LocalDir $unitLocal -Kind 'mirror' -Source 'A' -Destination 'BACKUP_B' -Result 'ok' -Verification 'differences' -Date ([datetime]'2026-01-02 03:04:05')
+    Assert-True ($unitPath -and (Test-Path -LiteralPath $unitPath)) "Add-RunRecord creates local\ and runs.csv"
+    $unit = @(Read-RunRecords $unitLocal)
+    Assert-Equal 1 $unit.Count "one record read back"
+    if ($unit.Count -ge 1) {
+        $values = ($unit[0].PSObject.Properties | ForEach-Object { $_.Value }) -join '|'
+        Assert-Equal '2026-01-02 03:04:05|mirror|A|BACKUP_B|ok|differences|not checked' $values "a record round-trips with every column, in order (verification: differences)"
+    }
+    Assert-Equal 0 @(Read-RunRecords (Join-Path $TestRoot 'no_such_local')).Count "no runs.csv: no records"
+
+    # ------------------------------------------------------------------
+    Write-Section "End to end (f): every mirror run is recorded once"
+
+    $runsLocal = Join-Path $TestRoot 'f_local'
+    $fx = New-Fixture 'f_passed'
+    $out = Invoke-RoboBakTest "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T;local=$runsLocal" @('S', 'D', '--verify') @('Y')
+    Assert-Contains $out "Recorded in" "a mirror run says it was recorded"
+    $records = @(Read-RunRecords $runsLocal)
+    Assert-Equal 1 $records.Count "one mirror run, one line"
+    if ($records.Count -ge 1) {
+        $r = $records[0]
+        Assert-True ($r.date -match $dateRx) "date is yyyy-MM-dd HH:mm:ss"
+        $age = (Get-Date) - [datetime]::ParseExact($r.date, 'yyyy-MM-dd HH:mm:ss', $null)
+        Assert-True ($age.TotalMinutes -ge 0 -and $age.TotalMinutes -lt 10) "date is the time of the run"
+        Assert-Equal 'mirror' $r.kind "kind is mirror"
+        Assert-Equal 'DATA_T' $r.source "source is the source label"
+        Assert-Equal 'BACKUP_T' $r.destination "destination is the destination label"
+        Assert-Equal 'ok' $r.result "result is ok"
+        Assert-Equal 'passed' $r.verification "verification passed"
+        Assert-Equal 'not checked' $r.health "health is not checked (no disk health yet)"
+    }
+
+    $fx = New-Fixture 'f_noverify'
+    $out = Invoke-RoboBakTest "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T;local=$runsLocal" @('S', 'D', '--no-verify') @('Y')
+    $fx = New-Fixture 'f_askno'
+    $out = Invoke-RoboBakTest "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T;local=$runsLocal" @('S', 'D') @('Y', 'N')
+    $records = @(Read-RunRecords $runsLocal)
+    Assert-Equal 3 $records.Count "three runs, three lines"
+    if ($records.Count -ge 3) {
+        Assert-Equal 'ok|not performed' "$($records[1].result)|$($records[1].verification)" "--no-verify: ok, not performed"
+        Assert-Equal 'ok|not performed' "$($records[2].result)|$($records[2].verification)" "verify question answered N: ok, not performed"
+    }
+
+    # Cancelled and refused runs write nothing
+    $fx = New-Fixture 'f_cancel'
+    $out = Invoke-RoboBakTest "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T;local=$runsLocal" @('S', 'D', '--verify') @('N')
+    $out = Invoke-RoboBakTest "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|NOT_A_BACKUP;local=$runsLocal" @('S', 'D', '--verify') @('Y')
+    $out = Invoke-RoboBakTest "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T;local=$runsLocal" @('S', 'S') @('Y')
+    Assert-Equal 3 @(Read-RunRecords $runsLocal).Count "cancelled and refused runs write no line"
+
+    # The file: header once (unquoted), one line per run, UTF-8 with a BOM
+    $runsFile = Join-Path $runsLocal 'runs.csv'
+    $raw = [System.IO.File]::ReadAllLines($runsFile, [System.Text.Encoding]::UTF8)
+    Assert-Equal 'date,kind,source,destination,result,verification,health' $raw[0] "the first line is the header"
+    Assert-Equal 1 @($raw | Where-Object { $_ -like 'date,kind,*' }).Count "the header is written only once across runs"
+    Assert-Equal 4 @($raw | Where-Object { $_.Trim() }).Count "the header plus one line per run"
+    $bytes = [System.IO.File]::ReadAllBytes($runsFile)
+    Assert-True ($bytes.Count -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) "runs.csv starts with a UTF-8 BOM"
+
+    # Labels with quotes, commas and accents round-trip through Import-Csv
+    $oddLocal = Join-Path $TestRoot 'f_odd_local'
+    $oddSource = 'DATOS "' + [char]0xF1 + '", 1'
+    $oddDest = 'BACKUP_' + [char]0xC1 + ',2'
+    $fx = New-Fixture 'f_odd'
+    $out = Invoke-RoboBakTest "S=$($fx.Src)|$oddSource;D=$($fx.Dst)|$oddDest;local=$oddLocal" @('S', 'D', '--no-verify') @('Y')
+    $records = @(Read-RunRecords $oddLocal)
+    Assert-Equal 1 $records.Count "odd labels: one line"
+    if ($records.Count -ge 1) {
+        Assert-Equal $oddSource $records[0].source "a label with quotes, a comma and an accent round-trips"
+        Assert-Equal $oddDest $records[0].destination "a BACKUP_ label with an accent and a comma round-trips"
+    }
+
+    # Test mode without local= records nothing
+    $fx = New-Fixture 'f_nolocal'
+    $out = Invoke-RoboBakTest "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T" @('S', 'D', '--no-verify') @('Y')
+    Assert-Contains $out "isn't recorded in runs.csv" "test mode without local= says the run isn't recorded"
+    Assert-Equal 0 @(Get-ChildItem -LiteralPath $fx.Root -Recurse -Filter 'runs.csv' -ErrorAction SilentlyContinue).Count "test mode without local= writes no runs.csv"
+
+    # ------------------------------------------------------------------
+    Write-Section "End to end (g): --system-done"
+
+    $sysLocal = Join-Path $TestRoot 'g_local'
+    $sysPart = Join-Path $TestRoot 'g_sysimg'
+    Write-TestFile (Join-Path $sysPart 'image.bin') 1000 ((Get-Date).AddDays(-1))
+    $fx = New-Fixture 'g_mirror'
+    $sysBefore = Get-TreeSnapshot $sysPart
+    $dstBefore = Get-TreeSnapshot $fx.Dst
+    $tempBefore = Get-DryRunTempFiles
+    $sysEnv = "S=$sysPart|SYSIMG_T;X=$($fx.Dst)|BACKUP_T;local=$sysLocal"
+
+    $out = Invoke-RoboBakTest $sysEnv @('--system-done', 'S') @('Y')
+    Assert-Contains $out "SYSTEM BACKUP RECORDED" "--system-done S, answer Y: recorded"
+    $records = @(Read-RunRecords $sysLocal)
+    Assert-Equal 1 $records.Count "one system backup, one line"
+    if ($records.Count -ge 1) {
+        $r = $records[0]
+        Assert-True ($r.date -match $dateRx) "the system line has a date"
+        Assert-Equal 'system' $r.kind "kind is system"
+        Assert-Equal $env:COMPUTERNAME $r.source "source is the computer's name"
+        Assert-Equal 'SYSIMG_T' $r.destination "destination is the partition's label"
+        Assert-Equal 'ok|not performed|not checked' "$($r.result)|$($r.verification)|$($r.health)" "result ok, verification not performed, health not checked"
+    }
+
+    $out = Invoke-RoboBakTest $sysEnv @('--system-done', 'S') @('N')
+    Assert-Contains $out "Nothing was recorded" "answer N: cancelled, nothing recorded"
+    $out = Invoke-RoboBakTest $sysEnv @('--system-done', 'Q') @('Y')
+    Assert-Contains $out "not mapped" "an unmapped letter is refused"
+    $out = Invoke-RoboBakTest $sysEnv @('--system-done', 'X') @('Y')
+    Assert-Contains $out "NOT A SYSTEM IMAGE PARTITION" "a partition labeled BACKUP_ is refused"
+    $out = Invoke-RoboBakTest $sysEnv @('--system-done') @('Y')
+    Assert-Contains $out "needs the drive letter" "--system-done without a letter is refused"
+    $out = Invoke-RoboBakTest $sysEnv @('--SYSTEM-DONE', 'S') @('Y')
+    Assert-Contains $out "SYSTEM BACKUP RECORDED" "the option is case-insensitive"
+    Assert-Equal 2 @(Read-RunRecords $sysLocal).Count "only the two Y answers wrote lines (N and the refusals wrote none)"
+
+    Assert-NotContains $out "Checking what the mirror would change" "--system-done runs no dry run"
+    Assert-Equal $sysBefore (Get-TreeSnapshot $sysPart) "--system-done changes nothing on the partition"
+    Assert-Equal $dstBefore (Get-TreeSnapshot $fx.Dst) "--system-done changes nothing on the BACKUP_ drive it refused"
+    Assert-Equal ($tempBefore -join '|') ((Get-DryRunTempFiles) -join '|') "--system-done leaves no dry-run temp files"
+
+    # ------------------------------------------------------------------
+    Write-Section "The repo's own local\ folder"
+
+    $realAfter = if (Test-Path -LiteralPath $RealRunsCsv) { (Get-FileHash -LiteralPath $RealRunsCsv).Hash } else { 'absent' }
+    Assert-Equal $RealRunsBefore $realAfter "the tests never wrote to the repo's own local\runs.csv"
 }
 catch {
     $script:Failed++
