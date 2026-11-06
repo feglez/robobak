@@ -632,6 +632,50 @@ try {
     Assert-Equal 0 @(Get-ChildItem -LiteralPath $fx.Root -Recurse -Filter 'runs.csv' -ErrorAction SilentlyContinue).Count "test mode without local= writes no runs.csv"
 
     # ------------------------------------------------------------------
+    Write-Section "End to end (f2): verification finds differences"
+
+    # The answers are typed one at a time: Y to the confirmation; once the copy
+    # is done (backup_history.txt is written just before the verify question),
+    # a new file is added to the source; then Y to the verify question, so the
+    # verification finds a difference.
+    $fx = New-Fixture 'f2_diff'
+    $diffLocal = Join-Path $TestRoot 'f2_local'
+    $env:ROBOBAK_TEST = "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T;local=$diffLocal"
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$RoboBak`" S D"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $env:ROBOBAK_TEST = $null
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
+    $proc.StandardInput.WriteLine('Y')
+    $historyFile = Join-Path $fx.Src 'backup_logs\backup_history.txt'
+    $deadline = (Get-Date).AddSeconds(60)
+    while (-not (Test-Path -LiteralPath $historyFile) -and -not $proc.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+    Start-Sleep -Milliseconds 500
+    Write-TestFile (Join-Path $fx.Src 'added after the copy.txt') 5 (Get-Date)
+    $proc.StandardInput.WriteLine('Y')
+    $proc.StandardInput.Close()
+    $finished = $proc.WaitForExit(60000)
+    if (-not $finished) { $proc.Kill() }
+    Assert-True $finished "the run finished"
+    $out = $stdoutTask.Result + $stderrTask.Result
+    Assert-Contains $out "VERIFICATION WARNING: Differences found." "the screen reports the differences"
+    $summary = Get-Content -LiteralPath (Join-Path $fx.Dst 'current_backup_logs\backup_summary.txt') -Raw -Encoding UTF8
+    Assert-Contains $summary "Verification: Differences found." "the summary reports the differences"
+    $times = Get-Content -LiteralPath (Join-Path $fx.Src 'backup_logs\backup_times.txt') -Raw -Encoding UTF8
+    Assert-Contains $times "(OK (verify: differences))" "backup_times.txt records OK with differences"
+    $records = @(Read-RunRecords $diffLocal)
+    Assert-Equal 1 $records.Count "the run is recorded once"
+    if ($records.Count -ge 1) {
+        Assert-Equal 'ok|differences' "$($records[0].result)|$($records[0].verification)" "differences: ok, differences"
+    }
+
+    # ------------------------------------------------------------------
     Write-Section "End to end (g): --system-done"
 
     $sysLocal = Join-Path $TestRoot 'g_local'
