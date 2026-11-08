@@ -109,10 +109,11 @@ function Write-RunRecord {
         [string]$Source,
         [string]$Destination,
         [string]$Result,
-        [string]$Verification
+        [string]$Verification,
+        [string]$Health = 'not checked'
     )
     try {
-        $path = Add-RunRecord -LocalDir (Get-RoboBakLocalDir $PSScriptRoot) -Kind $Kind -Source $Source -Destination $Destination -Result $Result -Verification $Verification
+        $path = Add-RunRecord -LocalDir (Get-RoboBakLocalDir $PSScriptRoot) -Kind $Kind -Source $Source -Destination $Destination -Result $Result -Verification $Verification -Health $Health
         if ($path) {
             Write-Host "Recorded in `"$path`"." -ForegroundColor DarkGray
             return $true
@@ -125,10 +126,188 @@ function Write-RunRecord {
     }
 }
 
+# Invoke-HealthHelper: starts robobak-health.ps1 with admin rights and waits for
+# it. Returns .Status (ok, cancelled or failed), .Disks and .Error. Cancelling the
+# admin prompt makes Start-Process throw. Test mode runs the helper the same way
+# but without elevation, and a file in the health= folder simulates cancelling.
+function Invoke-HealthHelper {
+    $resultPath = Join-Path $env:TEMP ("robobak_health_" + [guid]::NewGuid().ToString('N') + ".json")
+    $helper = Join-Path $PSScriptRoot "robobak-health.ps1"
+    $start = @{
+        FilePath     = 'powershell.exe'
+        ArgumentList = "-NoProfile -ExecutionPolicy Bypass -File `"$helper`" -ResultPath `"$resultPath`""
+        Wait         = $true
+        WindowStyle  = 'Hidden'
+        ErrorAction  = 'Stop'
+    }
+    if ($TestMode) {
+        if (Test-Path -LiteralPath (Join-Path (Get-RoboBakTestMap).Health 'cancel_elevation.txt')) {
+            return [pscustomobject]@{ Status = 'cancelled'; Disks = @(); Error = $null }
+        }
+    } else {
+        $start['Verb'] = 'RunAs'
+    }
+    try {
+        Start-Process @start
+    } catch {
+        return [pscustomobject]@{ Status = 'cancelled'; Disks = @(); Error = $null }
+    }
+    if (-not (Test-Path -LiteralPath $resultPath)) {
+        return [pscustomobject]@{ Status = 'failed'; Disks = @(); Error = 'the helper wrote no result' }
+    }
+    try {
+        $json = Get-Content -LiteralPath $resultPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        return [pscustomobject]@{ Status = 'failed'; Disks = @(); Error = 'the helper wrote an unreadable result' }
+    } finally {
+        Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
+    }
+    if ($json.Error) { return [pscustomobject]@{ Status = 'failed'; Disks = @(); Error = $json.Error } }
+    return [pscustomobject]@{ Status = 'ok'; Disks = @($json.Disks); Error = $null }
+}
+
+# Select-HealthDisk: the first time on a VeraCrypt volume, lists the disks and
+# asks which one holds it and the year it was bought (optional). Returns
+# .Reading and .Year, or $null if the user skips.
+function Select-HealthDisk {
+    param($Drive, $Disks)
+    $list = @($Disks)
+    Write-Host ""
+    Write-Host "First health check of $($Drive.Root) ($($Drive.Label)). Which disk holds it?" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $list.Count; $i++) {
+        $size = if ($null -ne $list[$i].CapacityBytes) { Format-Size $list[$i].CapacityBytes } else { 'unknown size' }
+        Write-Host ("   {0}. {1}, serial {2}, {3}" -f ($i + 1), $list[$i].Model, $list[$i].Serial, $size)
+    }
+    $answer = Read-Host "Type the disk's number, or anything else to skip this drive"
+    $n = 0
+    if (-not [int]::TryParse($answer, [ref]$n) -or $n -lt 1 -or $n -gt $list.Count) { return $null }
+    $yearText = Read-Host "Year you got this disk, e.g. 2021 (optional, Enter to skip)"
+    $year = if ($yearText -match '^(19|20)\d{2}$') { [int]$yearText } else { $null }
+    return [pscustomobject]@{ Reading = $list[$n - 1]; Year = $year }
+}
+
+# Resolve-HealthDisk: which reading belongs to a drive. A plain partition is found
+# through Windows. A VeraCrypt volume, through the serial saved on the drive, or
+# by asking the first time. .Reading is $null if the disk can't be found.
+function Resolve-HealthDisk {
+    param($Drive, $Disks, [string]$HealthDir)
+    $link = Read-DiskLink $HealthDir
+    $linkYear = if ($null -ne $link) { $link.year } else { $null }
+    $number = Get-DiskNumberForLetter $Drive.Letter
+    if ($null -ne $number) {
+        return [pscustomobject]@{ Reading = (Find-DiskByLetter $Disks $Drive.Letter $number); Year = $linkYear }
+    }
+    if ($null -ne $link) {
+        return [pscustomobject]@{ Reading = @(@($Disks) | Where-Object { $_.Serial -eq $link.serial })[0]; Year = $linkYear }
+    }
+    if (@($Disks).Count -eq 0) { return [pscustomobject]@{ Reading = $null; Year = $null } }
+    $choice = Select-HealthDisk $Drive $Disks
+    if ($null -eq $choice) { return [pscustomobject]@{ Reading = $null; Year = $null } }
+    Write-DiskLink $HealthDir $choice.Reading.Serial $choice.Reading.Model $choice.Year
+    return $choice
+}
+
+# Write-HealthNotLogged: writes a line without a reading on every drive of the run.
+function Write-HealthNotLogged {
+    param([string]$Kind, $Drives, [string]$Level, [int]$CopyErrors, [string]$Verification)
+    foreach ($d in $Drives) {
+        Add-HealthLine (Get-HealthDir $d.Root $d.Role) (ConvertTo-HealthLine -Kind $Kind -Level $Level -CopyErrors $CopyErrors -Verification $Verification)
+    }
+}
+
+# Invoke-RunHealth: the end-of-run disk health step, used by mirror runs and by
+# --system-done. Asks, reads the disks through the elevated helper, compares each
+# with its own history, writes a line on each drive, and returns the value for
+# the health column of runs.csv. It never stops the run: anything unexpected is
+# a yellow warning and "not checked". With no tool installed it asks nothing and
+# writes nothing on the drives, and the same goes for test mode without "health=".
+function Invoke-RunHealth {
+    param(
+        [string]$Kind,           # mirror | system
+        $Drives,                 # each with Letter, Root, Label, Role
+        [int]$CopyErrors,
+        [string]$Result,         # ok | failed
+        [string]$Verification    # passed | differences | not performed
+    )
+    try {
+        $map = Get-RoboBakTestMap
+        if ($map -and -not $map.Health) { return 'not checked' }
+        if (-not (Test-HealthToolAvailable)) {
+            Write-Host ""
+            Write-Host "Disk health not logged: neither smartmontools nor CrystalDiskInfo is installed (see usage_guide.md)." -ForegroundColor DarkGray
+            return 'not checked'
+        }
+
+        Write-Host ""
+        $approved = switch ($HealthMode) {
+            'yes'   { $true }
+            'no'    { $false }
+            default {
+                Write-Host "Log disk health? This needs admin rights." -ForegroundColor Cyan
+                (Read-Host "Type Y to log it, anything else to skip") -eq 'Y'
+            }
+        }
+        if (-not $approved) {
+            Write-HealthNotLogged $Kind $Drives 'not approved' $CopyErrors $Verification
+            Write-Host "Disk health not logged (not approved)." -ForegroundColor DarkYellow
+            return 'not approved'
+        }
+
+        Write-Host "Reading disk health (accept the admin prompt)..." -ForegroundColor Cyan
+        $readings = Invoke-HealthHelper
+        if ($readings.Status -eq 'cancelled') {
+            Write-HealthNotLogged $Kind $Drives 'not approved' $CopyErrors $Verification
+            Write-Host "Disk health not logged (the admin prompt was cancelled)." -ForegroundColor DarkYellow
+            return 'not approved'
+        }
+        if ($readings.Status -ne 'ok') {
+            Write-HealthNotLogged $Kind $Drives 'not checked' $CopyErrors $Verification
+            Write-Host "WARNING: could not read disk health: $($readings.Error)" -ForegroundColor Yellow
+            return 'not checked'
+        }
+
+        $settings = Read-RoboBakSettings (Get-RoboBakLocalDir $PSScriptRoot)
+        $levels = @()
+        Write-Host ""
+        Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
+        Write-Host "   DISK HEALTH" -ForegroundColor Cyan
+        Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
+        foreach ($d in $Drives) {
+            $dir = Get-HealthDir $d.Root $d.Role
+            $found = Resolve-HealthDisk $d $readings.Disks $dir
+            if ($null -eq $found.Reading) {
+                Add-HealthLine $dir (ConvertTo-HealthLine -Kind $Kind -Level 'not checked' -CopyErrors $CopyErrors -Verification $Verification)
+                Write-Host "   $($d.Root) ($($d.Label)): not checked (its disk wasn't found among the disks read)" -ForegroundColor Yellow
+                $levels += 'not checked'
+                continue
+            }
+            $r = $found.Reading
+            $previous = Read-PreviousHealthReading (Join-Path $dir 'disk_health.txt') $r.Serial
+            $warnings = @(Get-HealthWarnings -Reading $r -Previous $previous -CopyErrors $CopyErrors -Result $Result -Verification $Verification -Settings $settings -Year $found.Year)
+            $level = Get-HealthLevel $warnings
+            Add-HealthLine $dir (ConvertTo-HealthLine -Kind $Kind -Level $level -Reading $r -CopyErrors $CopyErrors -Verification $Verification)
+            $levels += $level
+            $color = switch ($level) { 'red' { 'Red' } 'yellow' { 'Yellow' } default { 'Green' } }
+            Write-Host "   $($d.Root) ($($d.Label)): $($level.ToUpper())" -ForegroundColor $color
+            Write-Host "      $($r.Model), serial $($r.Serial), read with $($r.Tool)" -ForegroundColor DarkGray
+            foreach ($w in $warnings) {
+                $wColor = if ($w.Level -eq 'red') { 'Red' } else { 'Yellow' }
+                Write-Host "      $($w.Level.ToUpper()): $($w.Text)" -ForegroundColor $wColor
+            }
+        }
+        Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
+        return (Get-OverallHealth $levels)
+    } catch {
+        Write-Host "WARNING: could not log disk health: $($_.Exception.Message)" -ForegroundColor Yellow
+        return 'not checked'
+    }
+}
+
 # Complete-MirrorRun: the end of every mirror run that ran the copy, whatever
 # happened (copy failed, verification skipped, passed or with differences).
 # Appends the verification result to the summary (if given), writes the timing
-# entry on the source, records the run in local\runs.csv, and waits for Enter.
+# entry on the source, logs disk health, records the run in local\runs.csv, and
+# waits for Enter.
 # It reads the run's variables ($SourceLabel, $DryRun, $copyDuration...) from
 # the script.
 function Complete-MirrorRun {
@@ -147,7 +326,16 @@ function Complete-MirrorRun {
     $copiedBytes = if ($null -ne $DryRun.Stats) { $DryRun.Stats.CopyBytes } else { $null }
     Update-TimesLog -SrcLabel $SourceLabel -DstLabel $DestLabel -DryRunDuration $DryRun.Duration -CountDuration $countDuration -CopyDuration $copyDuration -CopiedBytes $copiedBytes -VerifyDuration $VerifyDuration -Flags $flagsStr -Status $TimesStatus
 
-    $null = Write-RunRecord -Kind 'mirror' -Source $SourceLabel -Destination $DestLabel -Result $Result -Verification $Verification
+    # Disk health comes before the run record, whose health column it fills.
+    # 'ERROR \d' matches robocopy's real error lines, not the table's "ERROR" header.
+    $copyErrors = @(Select-String -Path $LogRobo -Pattern 'ERROR \d' -ErrorAction SilentlyContinue).Count
+    $runDrives = @(
+        @{ Letter = $SourceLetter; Root = $Source; Label = $SourceLabel; Role = 'source' }
+        @{ Letter = $DestLetter;   Root = $Dest;   Label = $DestLabel;   Role = 'destination' }
+    )
+    $health = Invoke-RunHealth -Kind 'mirror' -Drives $runDrives -CopyErrors $copyErrors -Result $Result -Verification $Verification
+
+    $null = Write-RunRecord -Kind 'mirror' -Source $SourceLabel -Destination $DestLabel -Result $Result -Verification $Verification -Health $health
 
     Read-Host "Press Enter to continue..."
     exit
@@ -169,14 +357,20 @@ function Show-Help {
     Write-Host "      --no-verify      Skip verification without asking"
     Write-Host "      --show-progress  Show a progress bar during the backup"
     Write-Host "      --verbose        Show every file operation on the terminal (/TEE)"
+    Write-Host "      --health         Log disk health at the end without asking"
+    Write-Host "      --no-health      Don't log disk health, and don't ask"
     Write-Host ""
     Write-Host "   NOTE: --show-progress and --verbose cannot be used together."
     Write-Host ""
     Write-Host "   Recording a system backup (made with another program):"
-    Write-Host "      .\robobak.ps1 --system-done [Letter]"
+    Write-Host "      .\robobak.ps1 --system-done [Letter] [--health | --no-health]"
     Write-Host "      Records in local\runs.csv that a system backup was just"
     Write-Host "      written to the partition at [Letter]. It never copies or"
     Write-Host "      deletes anything. A partition labeled BACKUP_* is refused."
+    Write-Host ""
+    Write-Host "   Disk health (needs smartmontools or CrystalDiskInfo, and admin):"
+    Write-Host "    - At the end of a run, RoboBak asks whether to log the health"
+    Write-Host "      of the disks used, and shows red or yellow warnings."
     Write-Host ""
     Write-Host "   Examples:"
     Write-Host "      .\robobak.ps1 F E"
@@ -207,6 +401,7 @@ function Show-Help {
     Write-Host "         sorted by name, with NEWEST/OLDEST tags)."
     Write-Host "       - `"backup_times.txt`" (Rolling log of the last 10"
     Write-Host "         backups with timing information)."
+    Write-Host "       - `"disk_health.txt`" (This drive's disk health history)."
     Write-Host "    2. On Destination (current_backup_logs\):"
     Write-Host "       - `"robocopy_log.txt`" (Full technical report)."
     Write-Host "       - `"backup_summary.txt`" (Status, date, details,"
@@ -216,6 +411,8 @@ function Show-Help {
     Write-Host "       - `"dry_run_list.txt`" (What the mirror deleted and"
     Write-Host "         copied, as listed by the dry run)."
     Write-Host "       - `"dry_run_log.txt`" (Full robocopy dry-run report)."
+    Write-Host "       On Destination (robobak_health\, kept between runs):"
+    Write-Host "       - `"disk_health.txt`" (This drive's disk health history)."
     Write-Host "    3. Next to the script (local\, ignored by Git):"
     Write-Host "       - `"runs.csv`" (One line per mirror run and per"
     Write-Host "         recorded system backup)."
@@ -237,7 +434,14 @@ if ($args.Count -eq 0 -or $args[0] -eq '/?' -or $args[0] -eq '-h') {
 # copies or deletes anything and runs no robocopy. The partition needs no
 # BACKUP_ label; a BACKUP_ label is refused, because the system image partition
 # never has one, so it most likely means the mirror drive's letter was typed.
+$HealthMode = "ask"   # ask | yes (--health) | no (--no-health)
 if (([string]$args[0]).ToLower() -eq '--system-done') {
+    for ($i = 2; $i -lt $args.Count; $i++) {
+        switch (([string]$args[$i]).ToLower()) {
+            "--health"    { $HealthMode = "yes" }
+            "--no-health" { $HealthMode = "no" }
+        }
+    }
     $SysLetter = if ($args.Count -ge 2) { [string]$args[1] } else { '' }
     if ($SysLetter -notmatch '^[A-Za-z]$') {
         Write-Host "[ERROR] --system-done needs the drive letter of the system image partition (e.g.: .\robobak.ps1 --system-done S)." -ForegroundColor Red
@@ -290,7 +494,9 @@ if (([string]$args[0]).ToLower() -eq '--system-done') {
         Read-Host "Press Enter to continue..."
         exit
     }
-    $sysRecorded = Write-RunRecord -Kind 'system' -Source $env:COMPUTERNAME -Destination $SysLabel -Result 'ok' -Verification 'not performed'
+    $sysDrives = @(@{ Letter = $SysLetter; Root = $SysRoot; Label = $SysLabelText; Role = 'image' })
+    $sysHealth = Invoke-RunHealth -Kind 'system' -Drives $sysDrives -CopyErrors 0 -Result 'ok' -Verification 'not performed'
+    $sysRecorded = Write-RunRecord -Kind 'system' -Source $env:COMPUTERNAME -Destination $SysLabel -Result 'ok' -Verification 'not performed' -Health $sysHealth
     Write-Host ""
     Write-Host "=================================================================" -ForegroundColor DarkGray
     if ($sysRecorded) {
@@ -324,6 +530,8 @@ for ($i = 2; $i -lt $args.Count; $i++) {
         "--no-verify"     { $VerifyMode = "no" }
         "--show-progress" { $ShowProgress = $true }
         "--verbose"       { $VerboseMode = $true }
+        "--health"        { $HealthMode = "yes" }
+        "--no-health"     { $HealthMode = "no" }
     }
 }
 
@@ -356,6 +564,7 @@ if ($TestMode -and ($null -eq $Source -or $null -eq $Dest)) {
 # Log folders and files
 $SourceLogsDir = Join-Path $Source "backup_logs"
 $DestLogsDir   = Join-Path $Dest   "current_backup_logs"
+$DestHealthDir = Join-Path $Dest   "robobak_health"
 
 $LogRobo    = Join-Path $DestLogsDir "robocopy_log.txt"
 $LogSummary = Join-Path $DestLogsDir "backup_summary.txt"
@@ -440,7 +649,7 @@ if ($DestLabel -notmatch '^BACKUP_') {
 # Directories excluded from the copy. The dry run uses exactly the same list,
 # so its counts match what the real copy will do (see section 8 for the reason
 # behind each exclusion).
-$ExcludeDirs = @('$RECYCLE.BIN', "System Volume Information", $DestLogsDir)
+$ExcludeDirs = @('$RECYCLE.BIN', "System Volume Information", $DestLogsDir, $DestHealthDir)
 
 # Thresholds for the red "large deletion" warning, from local\settings.json
 # (section "robobak"), or the defaults (500 files, 5 GB) if it doesn't set them.
@@ -653,6 +862,8 @@ $flagsStr = if ($flagsUsed.Count -gt 0) { $flagsUsed -join ", " } else { "(none)
 #              - $DestLogsDir (current_backup_logs): destination-only folder containing
 #                robocopy_log.txt (being written to during the copy) and other script-generated
 #                logs. Uses the full path to avoid excluding user folders with the same name
+#              - $DestHealthDir (robobak_health): destination-only folder with the drive's disk
+#                health history, which /MIR would otherwise delete. Also by full path
 
 $RoboCommon = @(
     "/MIR", "/MT:16", "/DCOPY:DAT", "/R:3", "/W:5", "/V",
@@ -761,7 +972,7 @@ Get-RoboSummaryLines (Get-Content $LogRobo)
 Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
 Write-Host "   Copy duration: $($copyDuration.ToString('hh\:mm\:ss'))" -ForegroundColor Cyan
 if ($RoboExit -lt 8) {
-    Write-Host "   Note: 1 Extra dir is expected (destination logs folder)" -ForegroundColor DarkGray
+    Write-Host "   Note: 1 or 2 Extra dirs are expected (destination logs and health folders)" -ForegroundColor DarkGray
 }
 Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
 
@@ -906,6 +1117,7 @@ Write-Host ""
 #   /XD    Exclude directories (full paths to avoid excluding user folders with the same name):
 #          - $RECYCLE.BIN, System Volume Information: same system folders as the backup
 #          - $DestLogsDir (current_backup_logs): destination-only folder with script-generated logs
+#          - $DestHealthDir (robobak_health): destination-only folder with the disk health history
 #          - $SourceLogsDir (backup_logs on source): updated AFTER the copy (section 10),
 #            so its contents are newer on the source than the destination copy
 #          - backup_logs on destination: must also be excluded because /XD only matches
@@ -915,8 +1127,8 @@ Write-Host ""
 #          Without /XD, these expected differences would cause a false verification failure.
 #
 # Robocopy exit code caveat: /XD excludes a directory from being logged and from
-# file-level comparison, but robocopy still counts the excluded destination-only
-# directory as 1 "EXTRA" in its stats table. This makes the exit code 2 (extras
+# file-level comparison, but robocopy still counts each excluded destination-only
+# directory as an "EXTRA" in its stats table. This makes the exit code 2 (extras
 # detected) even when the backup is a perfect match. This is a known robocopy
 # behaviour that cannot be suppressed.
 #
@@ -932,7 +1144,7 @@ $DestBackupLogsDir = Join-Path $Dest "backup_logs"
 "# Generated by RoboBak. Robocopy verification output -- lists differences between source and destination." | Set-Content -Path $LogVerify -Encoding UTF8
 $verifyStart = Get-Date
 # Redirect stdout to $null to suppress robocopy's "Log file:" console notice
-& robocopy $Source $Dest /MIR /L /MT:16 /R:3 /W:5 /LOG+:$LogVerify /XD '$RECYCLE.BIN' "System Volume Information" $DestLogsDir $SourceLogsDir $DestBackupLogsDir > $null
+& robocopy $Source $Dest /MIR /L /MT:16 /R:3 /W:5 /LOG+:$LogVerify /XD '$RECYCLE.BIN' "System Volume Information" $DestLogsDir $DestHealthDir $SourceLogsDir $DestBackupLogsDir > $null
 $VerifyExit = $LASTEXITCODE
 $verifyEnd = Get-Date
 $verifyDuration = $verifyEnd - $verifyStart
