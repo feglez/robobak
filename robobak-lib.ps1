@@ -766,14 +766,16 @@ function Invoke-Smartctl {
 
 # Get-CrystalDiskInfoText: runs CrystalDiskInfo and returns its report, or an
 # empty string if it isn't there. It writes DiskInfo.txt next to its executable.
+# An old report is deleted first, so a run that fails can't pass for today's.
 function Get-CrystalDiskInfoText {
     $map = Get-RoboBakTestMap
     if ($map) {
         $file = Join-Path $map.Health 'DiskInfo.txt'
     } else {
         if (-not (Test-Path -LiteralPath $script:CrystalDiskInfoPath)) { return '' }
-        Start-Process -FilePath $script:CrystalDiskInfoPath -ArgumentList '/CopyExit' -Wait -ErrorAction Stop
         $file = Join-Path (Split-Path -Parent $script:CrystalDiskInfoPath) 'DiskInfo.txt'
+        Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+        Start-Process -FilePath $script:CrystalDiskInfoPath -ArgumentList '/CopyExit' -Wait -ErrorAction Stop
     }
     if (-not (Test-Path -LiteralPath $file)) { return '' }
     return (Get-Content -LiteralPath $file -Raw -Encoding UTF8)
