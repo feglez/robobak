@@ -862,6 +862,327 @@ try {
     Assert-Equal 0 @($back | Where-Object { $null -eq $_.CopiedBytes -or $null -eq $_.DryRun }).Count "each new entry reads back its dry run and copied size"
 
     # ------------------------------------------------------------------
+    Write-Section "Disk health: reading the tools' output"
+
+    # New-SmartJson: what "smartctl -a -j" prints for an ATA disk, with the
+    # fields RoboBak reads (names from smartmontools' source; phase 8 checks them
+    # against the real program).
+    function New-SmartJson {
+        param([string]$Serial, [string]$Model = 'DISK MODEL', $Passed = $true, [int64]$A05 = 0, [int64]$AC5 = 0, [int64]$AC6 = 0, [int64]$AC7 = 0, [int64]$Hours = 1000, [int]$Temp = 35, [int]$ExitStatus = 0)
+        $rows = @()
+        foreach ($p in @(@(5, $A05), @(197, $AC5), @(198, $AC6), @(199, $AC7))) {
+            $rows += @{ id = $p[0]; name = 'attr'; value = 100; worst = 100; thresh = 0; raw = @{ value = $p[1]; string = "$($p[1])" } }
+        }
+        return (@{
+            smartctl = @{ exit_status = $ExitStatus }; model_name = $Model; serial_number = $Serial
+            user_capacity = @{ bytes = 1000000000000 }; smart_status = @{ passed = $Passed }
+            ata_smart_attributes = @{ table = $rows }; power_on_time = @{ hours = $Hours }; temperature = @{ current = $Temp }
+        } | ConvertTo-Json -Depth 6)
+    }
+    function Set-FakeDisk { param([string]$Dir, [string]$Name, [string]$Text) [System.IO.File]::WriteAllText((Join-Path $Dir $Name), $Text, (New-Object System.Text.UTF8Encoding($false))) }
+
+    $r = ConvertFrom-SmartctlJson (New-SmartJson 'SER1' 'MODEL X' -A05 2 -AC5 3 -AC6 4 -AC7 5 -Hours 777 -Temp 41) 3
+    Assert-Equal 'MODEL X|SER1|3' "$($r.Model)|$($r.Serial)|$($r.Number)" "smartctl: model, serial and disk number"
+    Assert-Equal '2|3|4|5' "$($r.A05)|$($r.AC5)|$($r.AC6)|$($r.AC7)" "smartctl: raw values of 05, C5, C6 and C7"
+    Assert-Equal '777|41|1000000000000' "$($r.Hours)|$($r.TempC)|$($r.CapacityBytes)" "smartctl: hours, temperature and capacity"
+    Assert-True ($r.Passed -eq $true) "smartctl: smart_status.passed is read"
+    $r = ConvertFrom-SmartctlJson (New-SmartJson 'SER2' -Passed $false -ExitStatus 0)
+    Assert-True ($r.Passed -eq $false) "smartctl: a failing status is read"
+    $r = ConvertFrom-SmartctlJson (New-SmartJson 'SER3' -ExitStatus 192)
+    Assert-True ($r.Passed -eq $true) "smartctl: a non-zero exit code alone doesn't mean failing (it's a bitmask)"
+    $nvme = '{"model_name":"NVME X","serial_number":"N1","nvme_total_capacity":1024,"smart_status":{"passed":true},"power_on_time":{"hours":5},"temperature":{"current":30}}'
+    $r = ConvertFrom-SmartctlJson $nvme 0
+    Assert-Equal 'N1|1024' "$($r.Serial)|$($r.CapacityBytes)" "smartctl NVMe: serial and capacity"
+    Assert-True ($null -eq $r.A05 -and $null -eq $r.AC7) "smartctl NVMe: no attribute table, so no attribute values"
+    Assert-True ($null -eq (ConvertFrom-SmartctlJson '{"smartctl":{"exit_status":2}}')) "smartctl: a reply with no serial identifies no disk"
+    Assert-True ($null -eq (ConvertFrom-SmartctlJson 'not json')) "smartctl: invalid JSON is no reading"
+    Assert-True ($null -eq (ConvertFrom-SmartctlJson '')) "smartctl: empty output is no reading"
+
+    $cdi = @'
+----------------------------------------------------------------------------
+CrystalDiskInfo
+-- Disk List ---------------------------------------------------------------
+ (1) USB DISK : 5000.9 GB [1/0/0, sa1]
+
+----------------------------------------------------------------------------
+ (1) USB DISK
+----------------------------------------------------------------------------
+           Model : USB DISK
+   Serial Number : CDI111
+       Disk Size : 5000.9 GB (8.4/137.4/5000.9/5000.9)
+  Power On Hours : 2345 horas
+     Temperature : 34 C (93 F)
+   Health Status : Bueno
+    Drive Letter : P: Q:
+
+-- S.M.A.R.T. --------------------------------------------------------------
+ID Cur Wor Thr RawValues(6) Attribute Name
+01 200 200 _51 000000000000 Tasa de errores
+05 200 200 140 00000000000A Sectores reasignados
+C5 200 200 _0 000000000001 Sectores pendientes
+C6 100 253 _0 000000000000 Sectores incorregibles
+C7 200 200 _0 0000000000FF Errores CRC
+
+----------------------------------------------------------------------------
+ (2) OTHER DISK
+----------------------------------------------------------------------------
+           Model : OTHER DISK
+   Serial Number : CDI222
+  Power On Hours : ----
+     Temperature : ----
+   Health Status : Good
+
+----------------------------------------------------------------------------
+ (3) BAD DISK
+----------------------------------------------------------------------------
+           Model : BAD DISK
+   Serial Number : CDI333
+   Health Status : Bad
+'@
+    $list = @(ConvertFrom-CrystalDiskInfoText $cdi)
+    Assert-Equal 3 $list.Count "CrystalDiskInfo: one reading per disk block, not the disk list"
+    Assert-Equal '10|1|0|255' "$($list[0].A05)|$($list[0].AC5)|$($list[0].AC6)|$($list[0].AC7)" "CrystalDiskInfo: raw values are read as hexadecimal, matched on the ID column"
+    Assert-Equal '2345|34|P: Q:' "$($list[0].Hours)|$($list[0].TempC)|$($list[0].DriveLetters)" "CrystalDiskInfo: hours, temperature and drive letters"
+    Assert-True ($null -eq $list[0].Passed) "CrystalDiskInfo: a translated health word reads as unknown"
+    Assert-True ($list[1].Passed -eq $true -and $list[2].Passed -eq $false) "CrystalDiskInfo: Good and Bad are understood"
+    Assert-True ($null -eq $list[1].Hours -and $null -eq $list[1].TempC) "CrystalDiskInfo: '----' reads as unknown"
+    Assert-Equal 'crystaldiskinfo' $list[0].Tool "CrystalDiskInfo: the tool is recorded"
+
+    $d = Join-Path $TestRoot 'health_readings'
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    Set-FakeDisk $d 'pd0.json' (New-SmartJson 'SAME')
+    Set-FakeDisk $d 'pd1.json' '{"smartctl":{"exit_status":2}}'
+    Set-FakeDisk $d 'pd1.sat.json' (New-SmartJson 'NEEDSSAT')
+    Set-FakeDisk $d 'pd2.json' '{"smartctl":{"exit_status":2}}'
+    Set-FakeDisk $d 'DiskInfo.txt' "Model : DUPLICATE`nSerial Number : SAME`n`nModel : FROM CDI`nSerial Number : ONLYCDI`n"
+    $env:ROBOBAK_TEST = "health=$d"
+    Assert-Equal $d (Get-RoboBakTestMap).Health "ROBOBAK_TEST: health= is read"
+    Assert-True (Test-HealthToolAvailable) "a health folder with data counts as a tool"
+    $disks = @((Get-HealthReadings).Disks)
+    Assert-Equal 'SAME|NEEDSSAT|ONLYCDI' (($disks | ForEach-Object { $_.Serial }) -join '|') "readings: smartctl, then -d sat, then CrystalDiskInfo for what's left, with no duplicates"
+    Assert-Equal 'smartctl|smartctl|crystaldiskinfo' (($disks | ForEach-Object { $_.Tool }) -join '|') "readings: each disk says which tool read it"
+    $env:ROBOBAK_TEST = $null
+
+    # ------------------------------------------------------------------
+    Write-Section "Disk health: the history file"
+
+    Assert-Equal 'C:\T\backup_logs' (Get-HealthDir 'C:\T\' 'source') "the data drive's history is in backup_logs"
+    Assert-Equal 'C:\T\robobak_health' (Get-HealthDir 'C:\T\' 'destination') "a backup drive's history is in robobak_health"
+    Assert-Equal 'C:\T\robobak_health' (Get-HealthDir 'C:\T\' 'image') "the image partition's history is in robobak_health"
+
+    $r = ConvertFrom-SmartctlJson (New-SmartJson 'A|B' 'MO|DEL' -A05 2 -AC5 3 -AC6 4 -AC7 5 -Hours 9 -Temp 40)
+    $line = ConvertTo-HealthLine -Kind 'mirror' -Level 'ok' -Reading $r -CopyErrors 1 -Verification 'passed' -Date ([datetime]'2026-02-01 10:00:00')
+    Assert-Contains $line '2026-02-01 10:00:00 | mirror | level=ok | smart=passed | 05=2 | C5=3 | C6=4 | C7=5 | hours=9 | tempC=40' "the line has the date, the kind and the readings"
+    Assert-Contains $line 'copyErrors=1 | verification=passed' "the line has the run's copy errors and verification"
+    Assert-Contains $line 'serial=A/B | model=MO/DEL' "a | inside a value can't break the columns"
+    $v = ConvertFrom-HealthLine $line
+    Assert-Equal 'mirror|ok|5' "$($v['kind'])|$($v['level'])|$($v['C7'])" "a line reads back"
+    Assert-True ($null -eq (ConvertFrom-HealthLine '# Generated by RoboBak.')) "the header is not a line"
+    $none = ConvertTo-HealthLine -Kind 'system' -Level 'not approved' -CopyErrors 0 -Verification 'not performed'
+    Assert-Contains $none 'level=not approved' "a line without a reading says why"
+    Assert-NotContains $none 'smart=' "a line without a reading has no readings"
+
+    $hd = Join-Path $TestRoot 'health_history'
+    $hf = Join-Path $hd 'disk_health.txt'
+    Assert-True ($null -eq (Read-PreviousHealthReading $hf 'X')) "no history file, no previous reading"
+    $old = ConvertFrom-SmartctlJson (New-SmartJson 'X' -A05 7)
+    Add-HealthLine $hd (ConvertTo-HealthLine -Kind 'mirror' -Level 'ok' -Reading $old -CopyErrors 0 -Verification 'passed')
+    Add-HealthLine $hd (ConvertTo-HealthLine -Kind 'mirror' -Level 'not approved' -CopyErrors 0 -Verification 'passed')
+    $bytes = [System.IO.File]::ReadAllBytes($hf)
+    Assert-True ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) "the history is UTF-8 with a BOM"
+    Assert-Equal 7 (Read-PreviousHealthReading $hf 'X').A05 "the previous reading skips lines without a reading"
+    Assert-True ($null -eq (Read-PreviousHealthReading $hf 'OTHER')) "a line of another disk isn't its previous reading"
+    Assert-Equal 3 @([System.IO.File]::ReadAllLines($hf) | Where-Object { $_ -match '^\d{4}|^#' }).Count "lines are appended under one header"
+
+    # ------------------------------------------------------------------
+    Write-Section "Disk health: the warning rules"
+
+    $ds = Read-RoboBakSettings $null
+    Assert-Equal '20000|5|50' "$($ds.HealthWarnHours)|$($ds.HealthWarnYears)|$($ds.HealthWarnTempC)" "default thresholds: 20,000 hours, 5 years, 50 C"
+    $setDir = Join-Path $TestRoot 'health_settings'
+    New-Item -ItemType Directory -Path $setDir -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $setDir 'settings.json'), '{"robobak":{"healthWarnHours":100,"healthWarnYears":1,"healthWarnTempC":-3}}')
+    $cs = Read-RoboBakSettings $setDir
+    Assert-Equal '100|1|50' "$($cs.HealthWarnHours)|$($cs.HealthWarnYears)|$($cs.HealthWarnTempC)" "thresholds are read from settings.json, and an invalid one keeps its default"
+    Assert-Contains $cs.Warning 'healthWarnTempC' "an invalid threshold is reported"
+
+    # New-R: a healthy reading with some fields replaced. Check-W: runs the rules
+    # and asserts the level and that one warning contains a given text.
+    function New-R {
+        param([hashtable]$Set = @{})
+        $base = @{ Passed = $true; A05 = 0; AC5 = 0; AC6 = 0; AC7 = 0; Hours = 100; TempC = 30 }
+        foreach ($k in $Set.Keys) { $base[$k] = $Set[$k] }
+        return [pscustomobject]$base
+    }
+    function Check-W {
+        param($Reading, $Previous, [string]$Level, [string]$Text, [string]$Name, [int]$CopyErrors = 0, [string]$Result = 'ok', [string]$Verification = 'passed', $Year = $null)
+        $w = @(Get-HealthWarnings -Reading $Reading -Previous $Previous -CopyErrors $CopyErrors -Result $Result -Verification $Verification -Settings $ds -Year $Year -CurrentYear 2026)
+        Assert-Equal $Level (Get-HealthLevel $w) "$Name (level)"
+        if ($Text) { Assert-Contains (($w | ForEach-Object { $_.Text }) -join ' / ') $Text "$Name (message)" }
+    }
+    $prevClean = [pscustomobject]@{ A05 = 0; AC5 = 0; AC6 = 0; AC7 = 0 }
+
+    Check-W (New-R) $prevClean 'ok' '' "a healthy disk with a clean history is ok"
+    Check-W (New-R) $null 'ok' '' "a first reading of a healthy disk is ok"
+    Check-W (New-R @{ Passed = $null }) $null 'ok' '' "an unknown SMART status raises nothing by itself"
+    Check-W (New-R @{ Passed = $false }) $prevClean 'red' 'SMART status is not OK' "RED: SMART status not OK"
+    foreach ($a in @(@('A05', '05'), @('AC5', 'C5'), @('AC6', 'C6'))) {
+        $key = $a[0]; $id = $a[1]
+        $p = [pscustomobject]@{ A05 = 0; AC5 = 0; AC6 = 0; AC7 = 0 }
+        Check-W (New-R @{ $key = 3 }) $p 'red' "$id" "RED: $id above zero for the first time (previous 0)"
+        Check-W (New-R @{ $key = 3 }) $null 'red' "for the first time" "RED: $id above zero on a first reading"
+        $p.$key = 3
+        Check-W (New-R @{ $key = 8 }) $p 'red' "rose from 3 to 8" "RED: $id rising"
+        Check-W (New-R @{ $key = 3 }) $p 'yellow' "above zero but not rising" "YELLOW: $id above zero but unchanged"
+        Check-W (New-R @{ $key = 0 }) $p 'ok' '' "$id back to zero raises nothing"
+    }
+    Check-W (New-R) $prevClean 'red' 'Copy errors in this run: 2' "RED: copy errors in this run" -CopyErrors 2
+    Check-W (New-R) $prevClean 'red' 'Copy errors' "RED: a failed copy" -Result 'failed'
+    Check-W (New-R) $prevClean 'red' 'found differences' "RED: failed verification" -Verification 'differences'
+    Check-W (New-R @{ AC7 = 4 }) ([pscustomobject]@{ A05 = 0; AC5 = 0; AC6 = 0; AC7 = 1 }) 'yellow' 'C7' "YELLOW: C7 rising"
+    Check-W (New-R @{ AC7 = 4 }) ([pscustomobject]@{ A05 = 0; AC5 = 0; AC6 = 0; AC7 = 4 }) 'ok' '' "C7 above zero but unchanged raises nothing"
+    Check-W (New-R @{ AC7 = 4 }) $null 'ok' '' "C7 on a first reading can't be rising"
+    Check-W (New-R @{ Hours = 20001 }) $prevClean 'yellow' 'Power-on hours' "YELLOW: power-on hours above 20,000"
+    Check-W (New-R @{ Hours = 20000 }) $prevClean 'ok' '' "exactly 20,000 hours is not above"
+    Check-W (New-R) $prevClean 'yellow' 'older than 5 years' "YELLOW: older than 5 years" -Year 2020
+    Check-W (New-R) $prevClean 'ok' '' "exactly 5 years is not older" -Year 2021
+    Check-W (New-R @{ TempC = 51 }) $prevClean 'yellow' 'Temperature' "YELLOW: temperature above 50 C"
+    Check-W (New-R @{ TempC = 50 }) $prevClean 'ok' '' "exactly 50 C is not above"
+    Check-W (New-R @{ Passed = $false; TempC = 60 }) $prevClean 'red' '' "a red and a yellow together are red"
+
+    Assert-Equal 'red' (Get-OverallHealth @('ok', 'red', 'yellow')) "overall: the worst disk"
+    Assert-Equal 'yellow' (Get-OverallHealth @('ok', 'yellow')) "overall: yellow"
+    Assert-Equal 'ok' (Get-OverallHealth @('ok', 'not checked')) "overall: a disk read beats one that couldn't be"
+    Assert-Equal 'not checked' (Get-OverallHealth @('not checked', 'not checked')) "overall: nothing read"
+
+    # ------------------------------------------------------------------
+    Write-Section "End to end (i): disk health"
+
+    # The helper is started through Start-Process with the same quoting as the
+    # real elevated run. These tests only prove that quoting when the repo's
+    # own path has spaces (the helper's -File argument).
+    function Get-LastRun { param([string]$LocalDir) return @(Read-RunRecords $LocalDir)[-1] }
+    function Get-HealthLines { param([string]$Dir) $f = Join-Path $Dir 'disk_health.txt'; if (Test-Path -LiteralPath $f) { return @([System.IO.File]::ReadAllLines($f, [System.Text.Encoding]::UTF8) | Where-Object { $_ -match '^\d{4}-' }) } return @() }
+    function Get-HelperTempFiles { return @(Get-ChildItem -LiteralPath $env:TEMP -Filter 'robobak_health_*' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }) }
+
+    $fx = New-Fixture 'i_health'
+    $hDir = Join-Path $fx.Root 'fake'
+    $iLocal = Join-Path $fx.Root 'local'
+    New-Item -ItemType Directory -Path $hDir -Force | Out-Null
+    Set-FakeDisk $hDir 'pd0.json' (New-SmartJson 'SRC111' 'SOURCE DISK')
+    Set-FakeDisk $hDir 'pd1.json' (New-SmartJson 'DST222' 'BACKUP DISK' -AC7 1)
+    $iEnv = "S=$($fx.Src)|DATA_T;D=$($fx.Dst)|BACKUP_T;local=$iLocal;health=$hDir"
+    $srcHealth = Join-Path $fx.Src 'backup_logs'
+    $dstHealth = Join-Path $fx.Dst 'robobak_health'
+    $thisYear = (Get-Date).Year
+    $tempBefore = Get-HelperTempFiles
+
+    $out = Invoke-RoboBakTest $iEnv @('S', 'D', '--verify') @('Y', 'Y', '1', "$thisYear", '2', '')
+    Assert-Contains $out "Log disk health? This needs admin rights." "the question is asked"
+    Assert-Contains $out "First health check of" "the first time, it asks which disk holds each volume"
+    Assert-Contains $out "1. SOURCE DISK, serial SRC111" "the disks are listed as the tool reports them"
+    Assert-Contains $out "VERIFICATION PASSED" "verification still passes with the health folder present"
+    Assert-Equal 1 @(Get-HealthLines $srcHealth).Count "1st run: one line on the data drive"
+    Assert-Equal 1 @(Get-HealthLines $dstHealth).Count "1st run: one line on the backup drive"
+    Assert-Contains (@(Get-HealthLines $srcHealth)[0]) "level=ok" "1st run: the data drive reads ok"
+    Assert-Contains (@(Get-HealthLines $srcHealth)[0]) "serial=SRC111" "1st run: the data drive's line is its own disk"
+    Assert-Contains (@(Get-HealthLines $dstHealth)[0]) "serial=DST222" "1st run: the backup drive's line is its own disk"
+    Assert-Contains (@(Get-HealthLines $dstHealth)[0]) "copyErrors=0 | verification=passed" "the line has the run's result"
+    $lnk = Read-DiskLink $srcHealth
+    Assert-Equal "SRC111|$thisYear" "$($lnk.serial)|$($lnk.year)" "the disk and the year are saved on the data drive"
+    $lnk = Read-DiskLink $dstHealth
+    Assert-Equal 'DST222|' "$($lnk.serial)|$($lnk.year)" "the year is optional, and the disk is saved on the backup drive"
+    Assert-Equal 'ok' (Get-LastRun $iLocal).health "1st run: runs.csv has health ok"
+    Assert-Equal ($tempBefore -join '|') ((Get-HelperTempFiles) -join '|') "the helper's temporary result is removed"
+
+    Set-FakeDisk $hDir 'pd1.json' (New-SmartJson 'DST222' 'BACKUP DISK' -AC5 2 -AC7 1)
+    $out = Invoke-RoboBakTest $iEnv @('S', 'D', '--verify') @('Y', 'Y')
+    Assert-NotContains $out "First health check of" "2nd run: the saved disk is used, without asking"
+    Assert-Contains $out "Will delete 0 files" "2nd run: the health history isn't counted as something to delete"
+    Assert-Contains $out "VERIFICATION PASSED" "2nd run: the health folder isn't a difference"
+    Assert-Equal 2 @(Get-HealthLines $dstHealth).Count "2nd run: the mirror kept the history, and one line was added"
+    Assert-Contains (@(Get-HealthLines $dstHealth)[1]) "level=red" "2nd run: C5 above zero for the first time is red"
+    Assert-Contains $out "RED: C5" "2nd run: the warning is on screen"
+    Assert-Equal 'red' (Get-LastRun $iLocal).health "2nd run: runs.csv has the worst disk's level"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $fx.Src 'robobak_health'))) "the health folder never reaches the source"
+
+    $out = Invoke-RoboBakTest $iEnv @('S', 'D', '--no-verify', '--no-health') @('Y')
+    Assert-NotContains $out "Log disk health?" "--no-health doesn't ask"
+    Assert-Contains (@(Get-HealthLines $srcHealth)[-1]) "level=not approved" "--no-health logs 'not approved' on the data drive"
+    Assert-Contains (@(Get-HealthLines $dstHealth)[-1]) "level=not approved" "--no-health logs 'not approved' on the backup drive"
+    Assert-Equal 'not approved' (Get-LastRun $iLocal).health "--no-health: runs.csv has 'not approved'"
+
+    $out = Invoke-RoboBakTest $iEnv @('S', 'D', '--no-verify') @('Y', 'N')
+    Assert-Contains $out "Disk health not logged (not approved)." "answering N logs nothing but 'not approved'"
+    Assert-Equal 'not approved' (Get-LastRun $iLocal).health "answering N: runs.csv has 'not approved'"
+
+    Set-FakeDisk $hDir 'cancel_elevation.txt' 'x'
+    $before = @(Get-HealthLines $dstHealth).Count
+    $out = Invoke-RoboBakTest $iEnv @('S', 'D', '--no-verify', '--health') @('Y')
+    Assert-NotContains $out "Log disk health?" "--health doesn't ask"
+    Assert-Contains $out "the admin prompt was cancelled" "a cancelled admin prompt is said on screen"
+    Assert-Equal ($before + 1) @(Get-HealthLines $dstHealth).Count "a cancelled admin prompt still adds a line"
+    Assert-Contains (@(Get-HealthLines $dstHealth)[-1]) "level=not approved" "a cancelled admin prompt is logged as 'not approved'"
+    Assert-Equal 'not approved' (Get-LastRun $iLocal).health "a cancelled admin prompt: runs.csv has 'not approved'"
+    Remove-Item -LiteralPath (Join-Path $hDir 'cancel_elevation.txt') -Force
+
+    $saved = Get-Content -LiteralPath (Join-Path $dstHealth 'disk_link.json') -Raw -Encoding UTF8
+    Write-DiskLink $dstHealth 'GONE999' 'OLD DISK' $null
+    $out = Invoke-RoboBakTest $iEnv @('S', 'D', '--no-verify', '--health') @('Y')
+    Assert-Contains $out "wasn't found among the disks read" "a saved disk that isn't connected is said on screen"
+    Assert-Contains (@(Get-HealthLines $dstHealth)[-1]) "level=not checked" "a saved disk that isn't connected is logged as 'not checked'"
+    Assert-Equal 'ok' (Get-LastRun $iLocal).health "the disk that could be read decides runs.csv"
+    [System.IO.File]::WriteAllText((Join-Path $dstHealth 'disk_link.json'), $saved)
+
+    $fx2 = New-Fixture 'i_health_skip'
+    $i2Local = Join-Path $fx2.Root 'local'
+    $out = Invoke-RoboBakTest "S=$($fx2.Src)|DATA_T;D=$($fx2.Dst)|BACKUP_T;local=$i2Local;health=$hDir" @('S', 'D', '--no-verify', '--health') @('Y', 'x', 'x')
+    Assert-Contains (@(Get-HealthLines (Join-Path $fx2.Dst 'robobak_health'))[0]) "level=not checked" "skipping the disk choice logs 'not checked'"
+    Assert-True ($null -eq (Read-DiskLink (Join-Path $fx2.Dst 'robobak_health'))) "skipping the disk choice saves nothing, so it asks again next time"
+    Assert-Equal 'not checked' (Get-LastRun $i2Local).health "skipping every disk: runs.csv has 'not checked'"
+
+    $fx3 = New-Fixture 'i_health_notool'
+    $i3Local = Join-Path $fx3.Root 'local'
+    $emptyHealth = Join-Path $fx3.Root 'fake_empty'
+    New-Item -ItemType Directory -Path $emptyHealth -Force | Out-Null
+    $out = Invoke-RoboBakTest "S=$($fx3.Src)|DATA_T;D=$($fx3.Dst)|BACKUP_T;local=$i3Local;health=$emptyHealth" @('S', 'D', '--no-verify', '--health') @('Y')
+    Assert-Contains $out "neither smartmontools nor CrystalDiskInfo is installed" "no tool: it's said on screen"
+    Assert-NotContains $out "Log disk health?" "no tool: it doesn't ask"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $fx3.Dst 'robobak_health'))) "no tool: nothing is written on the drive"
+    Assert-Equal 'not checked' (Get-LastRun $i3Local).health "no tool: runs.csv has 'not checked'"
+
+    $fx4 = New-Fixture 'i_health_system'
+    $i4Local = Join-Path $fx4.Root 'local'
+    $sysHealth = Join-Path $fx4.Root 'fake_sys'
+    New-Item -ItemType Directory -Path $sysHealth -Force | Out-Null
+    Set-FakeDisk $sysHealth 'pd1.json' (New-SmartJson 'IMG333' 'IMAGE DISK' -A05 2)
+    Set-FakeDisk $sysHealth 'disk_of_P.txt' '1'
+    $pEnv = "P=$($fx4.Dst)|SYSIMG_T;local=$i4Local;health=$sysHealth"
+    $out = Invoke-RoboBakTest $pEnv @('--system-done', 'P', '--health') @('Y')
+    Assert-NotContains $out "First health check of" "--system-done: a plain partition is matched without asking"
+    Assert-Contains (@(Get-HealthLines (Join-Path $fx4.Dst 'robobak_health'))[0]) "serial=IMG333" "--system-done: the line is on the partition, for its disk"
+    Assert-Contains (@(Get-HealthLines (Join-Path $fx4.Dst 'robobak_health'))[0]) "| system | " "--system-done: the line says it's a system backup"
+    Assert-Equal 'red' (Get-LastRun $i4Local).health "--system-done: runs.csv gets the health"
+    $out = Invoke-RoboBakTest $pEnv @('--system-done', 'P', '--no-health') @('Y')
+    Assert-Equal 'not approved' (Get-LastRun $i4Local).health "--system-done --no-health: runs.csv has 'not approved'"
+
+    $fx5 = New-Fixture 'i_health_cdi'
+    $i5Local = Join-Path $fx5.Root 'local'
+    $cdiHealth = Join-Path $fx5.Root 'fake_cdi'
+    New-Item -ItemType Directory -Path $cdiHealth -Force | Out-Null
+    Set-FakeDisk $cdiHealth 'DiskInfo.txt' $cdi
+    Set-FakeDisk $cdiHealth 'disk_of_P.txt' '1'
+    $out = Invoke-RoboBakTest "P=$($fx5.Dst)|SYSIMG_T;local=$i5Local;health=$cdiHealth" @('--system-done', 'P', '--health') @('Y')
+    Assert-Contains (@(Get-HealthLines (Join-Path $fx5.Dst 'robobak_health'))[0]) "tool=crystaldiskinfo" "CrystalDiskInfo fallback: the line says which tool read it"
+    Assert-Contains (@(Get-HealthLines (Join-Path $fx5.Dst 'robobak_health'))[0]) "serial=CDI111" "CrystalDiskInfo fallback: found by the partition's letter"
+
+    $fx6 = New-Fixture 'i_health_off'
+    $i6Local = Join-Path $fx6.Root 'local'
+    $out = Invoke-RoboBakTest "S=$($fx6.Src)|DATA_T;D=$($fx6.Dst)|BACKUP_T;local=$i6Local" @('S', 'D', '--no-verify') @('Y')
+    Assert-NotContains $out "isk health" "test mode without health= says nothing about disk health"
+    Assert-Equal 'not checked' (Get-LastRun $i6Local).health "test mode without health=: runs.csv has 'not checked'"
+
+    # ------------------------------------------------------------------
     Write-Section "The repo's own local\ folder"
 
     $realAfter = if (Test-Path -LiteralPath $RealRunsCsv) { (Get-FileHash -LiteralPath $RealRunsCsv).Hash } else { 'absent' }
