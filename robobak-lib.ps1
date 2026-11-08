@@ -9,6 +9,7 @@
 # Format: entries separated by ";":
 #   <letter>=<folder>|<label>   a fake drive: the letter maps to a folder and a label
 #   local=<folder>              the folder used instead of the repo's local\ folder
+#   health=<folder>             recorded disk-health data (see "DISK HEALTH" below)
 # Example:
 #   F=C:\Temp\rb\src|DATA;E=C:\Temp\rb\dst|BACKUP_TEST;local=C:\Temp\rb\local
 # In test mode, letters resolve ONLY through this map: an unmapped letter is an
@@ -23,7 +24,7 @@ function Test-RoboBakTestMode {
 # Throws on a malformed entry, so a typo never falls back to a real drive.
 function Get-RoboBakTestMap {
     if (-not (Test-RoboBakTestMode)) { return $null }
-    $map = @{ Drives = @{}; Local = $null }
+    $map = @{ Drives = @{}; Local = $null; Health = $null }
     foreach ($entry in ($env:ROBOBAK_TEST -split ';')) {
         $e = $entry.Trim()
         if (-not $e) { continue }
@@ -41,11 +42,13 @@ function Get-RoboBakTestMap {
         }
         if ($key -ieq 'local') {
             $map.Local = $folder
+        } elseif ($key -ieq 'health') {
+            $map.Health = $folder
         } elseif ($key -match '^[A-Za-z]$') {
             $label = if ($parts.Count -gt 1) { $parts[1].Trim() } else { '' }
             $map.Drives[$key.ToUpper()] = @{ Folder = $folder; Label = $label }
         } else {
-            throw "ROBOBAK_TEST: '$key' is not a drive letter or 'local'."
+            throw "ROBOBAK_TEST: '$key' is not a drive letter, 'local' or 'health'."
         }
     }
     return $map
@@ -121,9 +124,12 @@ function Get-RoboBakLocalDir {
 # and replaced by its default.
 #   deleteWarnFiles  red warning above this many files to delete (default 500)
 #   deleteWarnGB     red warning above this many GB to delete (default 5)
+#   healthWarnHours  yellow disk-health warning above this many power-on hours (default 20000)
+#   healthWarnYears  yellow disk-health warning for a disk older than this (default 5)
+#   healthWarnTempC  yellow disk-health warning above this temperature in C (default 50)
 function Read-RoboBakSettings {
     param([string]$LocalDir)
-    $result = [pscustomobject]@{ DeleteWarnFiles = 500; DeleteWarnGB = 5; Warning = $null }
+    $result = [pscustomobject]@{ DeleteWarnFiles = 500; DeleteWarnGB = 5; HealthWarnHours = 20000; HealthWarnYears = 5; HealthWarnTempC = 50; Warning = $null }
     if (-not $LocalDir) { return $result }
     $file = Join-Path $LocalDir 'settings.json'
     if (-not (Test-Path -LiteralPath $file)) { return $result }
@@ -136,7 +142,7 @@ function Read-RoboBakSettings {
     $section = $json.robobak
     if ($null -eq $section) { return $result }
     $bad = @()
-    foreach ($pair in @(@('deleteWarnFiles', 'DeleteWarnFiles'), @('deleteWarnGB', 'DeleteWarnGB'))) {
+    foreach ($pair in @(@('deleteWarnFiles', 'DeleteWarnFiles'), @('deleteWarnGB', 'DeleteWarnGB'), @('healthWarnHours', 'HealthWarnHours'), @('healthWarnYears', 'HealthWarnYears'), @('healthWarnTempC', 'HealthWarnTempC'))) {
         $value = $section.($pair[0])
         if ($null -eq $value) { continue }
         $number = 0.0
@@ -369,7 +375,7 @@ function Write-DryRunList {
 #   destination   destination label
 #   result        ok | failed | skipped
 #   verification  passed | differences | not performed
-#   health        not checked (until disk health exists) | ok | yellow | red | not approved
+#   health        ok | yellow | red | not approved | not checked (no tool, or no disk could be read)
 # The header is written unquoted when the file is created; rows are quoted by
 # ConvertTo-Csv, so labels with commas, quotes or accents round-trip. UTF-8 with
 # a BOM, so PowerShell 5.1 and Excel read accents correctly.
@@ -606,4 +612,362 @@ function Get-VerifyHintText {
         }
     }
     return "First verification to ${Dest}: no previous time."
+}
+
+# --- DISK HEALTH ---
+
+# At the end of a run, RoboBak can log the health of the disks it used. Reading
+# SMART needs admin rights, so an elevated helper (robobak-health.ps1) reads every
+# connected disk once and hands the result back through a temporary file. It uses
+# smartmontools (smartctl -a -j); the disks smartctl can't read come from
+# CrystalDiskInfo (/CopyExit) instead. These functions do the reading, the parsing
+# and the comparison; the prompts and the screen are in robobak.ps1.
+#
+# Each drive keeps its own history, one line per check, never wiped:
+#   data drive (the source):            backup_logs\disk_health.txt
+#   backup drives, image partition:     robobak_health\disk_health.txt
+# robobak_health\ is excluded from the mirror and the verification.
+#
+# A plain partition is matched to its disk through Windows (letter, then
+# Get-Partition's disk number, then /dev/pdN). Windows can't do that for a
+# VeraCrypt volume, so the first time RoboBak asks which disk holds it and saves
+# smartctl's serial in disk_link.json, on the drive, next to disk_health.txt.
+#
+# In test mode (a "health=<folder>" entry in ROBOBAK_TEST), the folder replaces
+# the tools and Windows:
+#   pd<N>.json, pd<N>.sat.json  what smartctl would print for /dev/pd<N> (without
+#                               and with "-d sat")
+#   DiskInfo.txt                what CrystalDiskInfo would write
+#   disk_of_<LETTER>.txt        the disk number of a plain partition
+#   cancel_elevation.txt        the admin prompt is cancelled
+
+$script:SmartctlPath        = 'C:\Program Files\smartmontools\bin\smartctl.exe'
+$script:CrystalDiskInfoPath = 'C:\Program Files\CrystalDiskInfo\DiskInfo64.exe'
+$script:HealthDirName       = 'robobak_health'
+
+# Get-HealthDir: the folder that holds a drive's health history and disk link.
+# Role: source (the data drive), destination or image (the system image partition).
+function Get-HealthDir {
+    param([string]$Root, [string]$Role)
+    if ($Role -eq 'source') { return (Join-Path $Root 'backup_logs') }
+    return (Join-Path $Root $script:HealthDirName)
+}
+
+# Test-HealthToolAvailable: is there anything to read SMART with?
+function Test-HealthToolAvailable {
+    $map = Get-RoboBakTestMap
+    if ($map) {
+        if (-not $map.Health) { return $false }
+        return (@(Get-ChildItem -LiteralPath $map.Health -Filter 'pd*.json' -File -ErrorAction SilentlyContinue).Count -gt 0) -or (Test-Path -LiteralPath (Join-Path $map.Health 'DiskInfo.txt'))
+    }
+    return (Test-Path -LiteralPath $script:SmartctlPath) -or (Test-Path -LiteralPath $script:CrystalDiskInfoPath)
+}
+
+# New-HealthReading: one disk as read by a tool. A value the tool doesn't give
+# is $null. Number is the Windows disk number (smartctl only).
+function New-HealthReading {
+    param($Number, [string]$Model, [string]$Serial, $CapacityBytes, $Passed, $A05, $AC5, $AC6, $AC7, $Hours, $TempC, [string]$Tool, [string]$DriveLetters)
+    return [pscustomobject][ordered]@{
+        Number = $Number; Model = $Model; Serial = $Serial; CapacityBytes = $CapacityBytes
+        Passed = $Passed; A05 = $A05; AC5 = $AC5; AC6 = $AC6; AC7 = $AC7
+        Hours = $Hours; TempC = $TempC; Tool = $Tool; DriveLetters = $DriveLetters
+    }
+}
+
+# ConvertFrom-SmartctlJson: the output of "smartctl -a -j" -> a reading, or $null
+# if it doesn't identify a disk. It reads smart_status and the attribute table,
+# not smartctl's exit code, which is a bitmask that can be non-zero on a healthy
+# disk. NVMe disks have no attribute table, so their 05, C5, C6 and C7 are $null.
+function ConvertFrom-SmartctlJson {
+    param([string]$Text, $Number = $null)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    try { $json = $Text | ConvertFrom-Json } catch { return $null }
+    if ($null -eq $json -or [string]::IsNullOrEmpty($json.serial_number)) { return $null }
+    $passed = $null
+    if ($null -ne $json.smart_status -and $null -ne $json.smart_status.passed) { $passed = [bool]$json.smart_status.passed }
+    $raw = @{}
+    foreach ($row in @($json.ata_smart_attributes.table)) {
+        if ($null -ne $row -and $null -ne $row.id -and $null -ne $row.raw -and $null -ne $row.raw.value) { $raw[[int]$row.id] = [int64]$row.raw.value }
+    }
+    $capacity = $null
+    if ($null -ne $json.user_capacity -and $null -ne $json.user_capacity.bytes) { $capacity = [int64]$json.user_capacity.bytes }
+    elseif ($null -ne $json.nvme_total_capacity) { $capacity = [int64]$json.nvme_total_capacity }
+    $hours = $null
+    if ($null -ne $json.power_on_time -and $null -ne $json.power_on_time.hours) { $hours = [int64]$json.power_on_time.hours }
+    $temp = $null
+    if ($null -ne $json.temperature -and $null -ne $json.temperature.current) { $temp = [int]$json.temperature.current }
+    return (New-HealthReading -Number $Number -Model $json.model_name -Serial $json.serial_number -CapacityBytes $capacity -Passed $passed -A05 $raw[5] -AC5 $raw[197] -AC6 $raw[198] -AC7 $raw[199] -Hours $hours -TempC $temp -Tool 'smartctl')
+}
+
+# ConvertFrom-CrystalDiskInfoText: the contents of DiskInfo.txt -> a reading per
+# disk. The headings ("Serial Number :") are fixed English text. The attribute
+# names are translated, so attributes are matched on the ID column, and the raw
+# values are hexadecimal. The health word can be translated too: only "Good" and
+# "Bad" are understood, and anything else reads as unknown.
+function ConvertFrom-CrystalDiskInfoText {
+    param([string]$Text)
+    $readings = New-Object System.Collections.Generic.List[object]
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+    $current = $null
+    $flush = {
+        if ($null -ne $current -and $current.Serial) {
+            $readings.Add((New-HealthReading -Model $current.Model -Serial $current.Serial -CapacityBytes $current.Capacity -Passed $current.Passed -A05 $current.Raw[5] -AC5 $current.Raw[197] -AC6 $current.Raw[198] -AC7 $current.Raw[199] -Hours $current.Hours -TempC $current.TempC -Tool 'crystaldiskinfo' -DriveLetters $current.Letters))
+        }
+    }
+    foreach ($line in ($Text -split '\r?\n')) {
+        if ($line -match '^\s*Model\s*:\s*(?<v>.*?)\s*$') {
+            . $flush
+            $current = @{ Model = $Matches['v']; Serial = ''; Capacity = $null; Passed = $null; Hours = $null; TempC = $null; Letters = ''; Raw = @{} }
+            continue
+        }
+        if ($null -eq $current) { continue }
+        if ($line -match '^\s*Serial Number\s*:\s*(?<v>.*?)\s*$') { $current.Serial = $Matches['v'] }
+        elseif ($line -match '^\s*Disk Size\s*:\s*(?<v>\d+(?:\.\d+)?)\s*GB') { $current.Capacity = [int64]([double]::Parse($Matches['v'], [System.Globalization.CultureInfo]::InvariantCulture) * 1000000000) }
+        elseif ($line -match '^\s*Power On Hours\s*:\s*(?<v>\d+)') { $current.Hours = [int64]$Matches['v'] }
+        elseif ($line -match '^\s*Temperature\s*:\s*(?<v>\d+)') { $current.TempC = [int]$Matches['v'] }
+        elseif ($line -match '^\s*Health Status\s*:\s*(?<v>\S+)') {
+            if ($Matches['v'] -eq 'Good') { $current.Passed = $true }
+            elseif ($Matches['v'] -eq 'Bad') { $current.Passed = $false }
+        }
+        elseif ($line -match '^\s*Drive Letter\s*:\s*(?<v>.*?)\s*$') { $current.Letters = $Matches['v'] }
+        elseif ($line -match '^(?<id>[0-9A-Fa-f]{2})\s+\S+\s+\S+\s+\S+\s+(?<raw>[0-9A-Fa-f]{12})\b') {
+            $current.Raw[[Convert]::ToInt32($Matches['id'], 16)] = [Convert]::ToInt64($Matches['raw'], 16)
+        }
+    }
+    . $flush
+    return $readings.ToArray()
+}
+
+# Get-HealthDiskNumbers: the Windows numbers of the connected disks.
+function Get-HealthDiskNumbers {
+    $map = Get-RoboBakTestMap
+    if ($map) {
+        return @(Get-ChildItem -LiteralPath $map.Health -Filter 'pd*.json' -File -ErrorAction SilentlyContinue | ForEach-Object { if ($_.Name -match '^pd(\d+)\.') { [int]$Matches[1] } } | Sort-Object -Unique)
+    }
+    return @(Get-CimInstance Win32_DiskDrive | ForEach-Object { [int]$_.Index } | Sort-Object)
+}
+
+# Invoke-Smartctl: what "smartctl -a -j" prints for a disk, as one string, or an
+# empty string. -Sat adds "-d sat", which some USB enclosures need.
+function Invoke-Smartctl {
+    param([int]$Number, [switch]$Sat)
+    $map = Get-RoboBakTestMap
+    if ($map) {
+        $name = if ($Sat) { "pd$Number.sat.json" } else { "pd$Number.json" }
+        $file = Join-Path $map.Health $name
+        if (Test-Path -LiteralPath $file) { return (Get-Content -LiteralPath $file -Raw -Encoding UTF8) }
+        return ''
+    }
+    $smartArgs = @('-a', '-j')
+    if ($Sat) { $smartArgs += @('-d', 'sat') }
+    $smartArgs += "/dev/pd$Number"
+    return ((& $script:SmartctlPath @smartArgs 2>$null) -join "`n")
+}
+
+# Get-CrystalDiskInfoText: runs CrystalDiskInfo and returns its report, or an
+# empty string if it isn't there. It writes DiskInfo.txt next to its executable.
+function Get-CrystalDiskInfoText {
+    $map = Get-RoboBakTestMap
+    if ($map) {
+        $file = Join-Path $map.Health 'DiskInfo.txt'
+    } else {
+        if (-not (Test-Path -LiteralPath $script:CrystalDiskInfoPath)) { return '' }
+        Start-Process -FilePath $script:CrystalDiskInfoPath -ArgumentList '/CopyExit' -Wait -ErrorAction Stop
+        $file = Join-Path (Split-Path -Parent $script:CrystalDiskInfoPath) 'DiskInfo.txt'
+    }
+    if (-not (Test-Path -LiteralPath $file)) { return '' }
+    return (Get-Content -LiteralPath $file -Raw -Encoding UTF8)
+}
+
+# Get-HealthReadings: reads every connected disk, in the elevated helper. Disks
+# smartctl can't read, even with "-d sat", come from CrystalDiskInfo.
+function Get-HealthReadings {
+    $disks = New-Object System.Collections.Generic.List[object]
+    $map = Get-RoboBakTestMap
+    $needFallback = $false
+    $numbers = @(Get-HealthDiskNumbers)
+    $hasSmartctl = if ($map) { $numbers.Count -gt 0 } else { Test-Path -LiteralPath $script:SmartctlPath }
+    if ($hasSmartctl) {
+        foreach ($n in $numbers) {
+            $reading = ConvertFrom-SmartctlJson (Invoke-Smartctl $n) $n
+            if ($null -eq $reading) { $reading = ConvertFrom-SmartctlJson (Invoke-Smartctl $n -Sat) $n }
+            if ($null -ne $reading) { $disks.Add($reading) } else { $needFallback = $true }
+        }
+    } else {
+        $needFallback = $true
+    }
+    if ($needFallback) {
+        foreach ($reading in @(ConvertFrom-CrystalDiskInfoText (Get-CrystalDiskInfoText))) {
+            if (-not ($disks | Where-Object { $_.Serial -eq $reading.Serial })) { $disks.Add($reading) }
+        }
+    }
+    return [pscustomobject]@{ Disks = $disks.ToArray(); Error = $null }
+}
+
+# Get-DiskNumberForLetter: the disk number of a plain partition, or $null for a
+# volume Windows has no partition for, such as a mounted VeraCrypt volume.
+function Get-DiskNumberForLetter {
+    param([string]$Letter)
+    $map = Get-RoboBakTestMap
+    if ($map) {
+        $file = Join-Path $map.Health "disk_of_$($Letter.ToUpper()).txt"
+        if (Test-Path -LiteralPath $file) { return [int](Get-Content -LiteralPath $file -Raw).Trim() }
+        return $null
+    }
+    $partition = Get-Partition -DriveLetter $Letter -ErrorAction SilentlyContinue
+    if ($null -eq $partition) { return $null }
+    return [int]@($partition)[0].DiskNumber
+}
+
+# Find-DiskByLetter: the reading of a plain partition's disk: by disk number, or
+# for a CrystalDiskInfo reading (which has none) by the letters it lists.
+function Find-DiskByLetter {
+    param($Disks, [string]$Letter, $Number)
+    foreach ($d in @($Disks)) { if ($null -ne $d.Number -and $d.Number -eq $Number) { return $d } }
+    foreach ($d in @($Disks)) { if ($d.DriveLetters -match "(^|\s)$Letter`:") { return $d } }
+    return $null
+}
+
+# Read-DiskLink / Write-DiskLink: disk_link.json, which remembers on the drive
+# which disk holds it (serial) and the year it was bought (or $null).
+function Read-DiskLink {
+    param([string]$HealthDir)
+    $file = Join-Path $HealthDir 'disk_link.json'
+    if (-not (Test-Path -LiteralPath $file)) { return $null }
+    try { return (Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
+}
+
+function Write-DiskLink {
+    param([string]$HealthDir, [string]$Serial, [string]$Model, $Year)
+    if (-not (Test-Path -LiteralPath $HealthDir)) { New-Item -ItemType Directory -Path $HealthDir -Force | Out-Null }
+    $text = [pscustomobject][ordered]@{ serial = $Serial; model = $Model; year = $Year } | ConvertTo-Json
+    [System.IO.File]::WriteAllText((Join-Path $HealthDir 'disk_link.json'), $text, (New-Object System.Text.UTF8Encoding($true)))
+}
+
+# Format-HealthValue: a value as written in disk_health.txt.
+function Format-HealthValue {
+    param($Value)
+    if ($null -eq $Value) { return 'unknown' }
+    return (([string]$Value) -replace '\|', '/').Trim()
+}
+
+# ConvertTo-HealthLine: one line of disk_health.txt. Without a reading, the line
+# only says why: level is "not approved" or "not checked".
+function ConvertTo-HealthLine {
+    param([string]$Kind, [string]$Level, $Reading, [int]$CopyErrors, [string]$Verification, $Date = $null)
+    if ($null -eq $Date) { $Date = Get-Date }
+    $fields = @($Date.ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture), $Kind, "level=$Level")
+    if ($null -ne $Reading) {
+        $smart = if ($null -eq $Reading.Passed) { 'unknown' } elseif ($Reading.Passed) { 'passed' } else { 'failed' }
+        $fields += "smart=$smart"
+        $fields += "05=$(Format-HealthValue $Reading.A05)"
+        $fields += "C5=$(Format-HealthValue $Reading.AC5)"
+        $fields += "C6=$(Format-HealthValue $Reading.AC6)"
+        $fields += "C7=$(Format-HealthValue $Reading.AC7)"
+        $fields += "hours=$(Format-HealthValue $Reading.Hours)"
+        $fields += "tempC=$(Format-HealthValue $Reading.TempC)"
+        $fields += "serial=$(Format-HealthValue $Reading.Serial)"
+        $fields += "model=$(Format-HealthValue $Reading.Model)"
+        $fields += "tool=$(Format-HealthValue $Reading.Tool)"
+    }
+    $fields += "copyErrors=$CopyErrors"
+    $fields += "verification=$Verification"
+    return ($fields -join ' | ')
+}
+
+# ConvertFrom-HealthLine: a line of disk_health.txt -> a hashtable, or $null for
+# the header and blank lines.
+function ConvertFrom-HealthLine {
+    param([string]$Line)
+    if ($Line -notmatch '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \| ') { return $null }
+    $parts = @($Line -split ' \| ')
+    $values = @{ date = $parts[0]; kind = $parts[1] }
+    foreach ($p in ($parts | Select-Object -Skip 2)) {
+        $eq = $p.IndexOf('=')
+        if ($eq -gt 0) { $values[$p.Substring(0, $eq)] = $p.Substring($eq + 1) }
+    }
+    return $values
+}
+
+# Read-PreviousHealthReading: the newest line of a history with a reading of the
+# same disk, as numbers ($null for "unknown"), or $null if there is none. Lines
+# that only say "not approved" or "not checked" are skipped.
+function Read-PreviousHealthReading {
+    param([string]$Path, [string]$Serial)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $lines = [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)
+    $wanted = Format-HealthValue $Serial
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        $v = ConvertFrom-HealthLine $lines[$i]
+        if ($null -eq $v -or -not $v.ContainsKey('smart') -or $v['serial'] -ne $wanted) { continue }
+        $number = { param($t) if ($t -match '^\d+$') { [int64]$t } else { $null } }
+        return [pscustomobject]@{ A05 = (& $number $v['05']); AC5 = (& $number $v['C5']); AC6 = (& $number $v['C6']); AC7 = (& $number $v['C7']) }
+    }
+    return $null
+}
+
+# Add-HealthLine: appends a line to a drive's disk_health.txt, creating the
+# folder and the file (UTF-8 with a BOM, with its header) if needed.
+function Add-HealthLine {
+    param([string]$HealthDir, [string]$Line)
+    if (-not (Test-Path -LiteralPath $HealthDir)) { New-Item -ItemType Directory -Path $HealthDir -Force | Out-Null }
+    $file = Join-Path $HealthDir 'disk_health.txt'
+    if (-not (Test-Path -LiteralPath $file)) {
+        $header = "# Generated by RoboBak. Disk health history of this drive, one line per check, never wiped.`r`n`r`n"
+        [System.IO.File]::WriteAllText($file, $header, (New-Object System.Text.UTF8Encoding($true)))
+    }
+    [System.IO.File]::AppendAllText($file, $Line + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# Get-HealthWarnings: the warnings for one disk, compared with the previous line
+# of the same drive's history ($null on a first reading). Red:
+#   SMART status not OK; 05, C5 or C6 rising, or above zero for the first time;
+#   copy errors or a failed verification in this run.
+# Yellow:
+#   05, C5 or C6 above zero but not rising; C7 rising; power-on hours, age or
+#   temperature above the thresholds in $Settings.
+function Get-HealthWarnings {
+    param($Reading, $Previous, [int]$CopyErrors, [string]$Result, [string]$Verification, $Settings, $Year = $null, [int]$CurrentYear = (Get-Date).Year)
+    $warnings = New-Object System.Collections.Generic.List[object]
+    $add = { param($level, $text) $warnings.Add([pscustomobject]@{ Level = $level; Text = $text }) }
+
+    if ($Reading.Passed -eq $false) { & $add 'red' 'SMART status is not OK.' }
+    foreach ($a in @(@('A05', '05', 'reallocated sectors'), @('AC5', 'C5', 'pending sectors'), @('AC6', 'C6', 'uncorrectable sectors'))) {
+        $now = $Reading.($a[0])
+        if ($null -eq $now -or $now -le 0) { continue }
+        $before = if ($null -ne $Previous) { $Previous.($a[0]) } else { $null }
+        if ($null -eq $before -or $before -eq 0) { & $add 'red' "$($a[1]) ($($a[2])) is above zero for the first time: $now." }
+        elseif ($now -gt $before) { & $add 'red' "$($a[1]) ($($a[2])) rose from $before to $now." }
+        else { & $add 'yellow' "$($a[1]) ($($a[2])) is above zero but not rising: $now." }
+    }
+    if ($Result -eq 'failed' -or $CopyErrors -gt 0) { & $add 'red' "Copy errors in this run: $CopyErrors (result: $Result)." }
+    if ($Verification -eq 'differences') { & $add 'red' 'The verification found differences in this run.' }
+
+    if ($null -ne $Previous -and $null -ne $Previous.AC7 -and $null -ne $Reading.AC7 -and $Reading.AC7 -gt $Previous.AC7) {
+        & $add 'yellow' "C7 (CRC errors, usually the enclosure or the cable) rose from $($Previous.AC7) to $($Reading.AC7)."
+    }
+    if ($null -ne $Reading.Hours -and $Reading.Hours -gt $Settings.HealthWarnHours) { & $add 'yellow' "Power-on hours are above $($Settings.HealthWarnHours): $($Reading.Hours)." }
+    if ($null -ne $Year -and ($CurrentYear - [int]$Year) -gt $Settings.HealthWarnYears) { & $add 'yellow' "The disk is older than $($Settings.HealthWarnYears) years (from $Year)." }
+    if ($null -ne $Reading.TempC -and $Reading.TempC -gt $Settings.HealthWarnTempC) { & $add 'yellow' "Temperature at the end is above $($Settings.HealthWarnTempC) C: $($Reading.TempC) C." }
+    return $warnings.ToArray()
+}
+
+# Get-HealthLevel: red if any warning is red, yellow if any is yellow, else ok.
+function Get-HealthLevel {
+    param($Warnings)
+    $list = @($Warnings)
+    if (@($list | Where-Object { $_.Level -eq 'red' }).Count -gt 0) { return 'red' }
+    if (@($list | Where-Object { $_.Level -eq 'yellow' }).Count -gt 0) { return 'yellow' }
+    return 'ok'
+}
+
+# Get-OverallHealth: the worst of the levels of the disks in a run, for the
+# health column of runs.csv. "not approved" and "not checked" only count when no
+# disk was read.
+function Get-OverallHealth {
+    param([string[]]$Levels)
+    foreach ($level in @('red', 'yellow', 'ok', 'not approved')) {
+        if ($Levels -contains $level) { return $level }
+    }
+    return 'not checked'
 }
