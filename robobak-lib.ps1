@@ -443,7 +443,7 @@ function Read-RunRecords {
 # existed): a missing line, "not performed" or "unknown" reads as $null.
 
 $script:DefaultCopySpeed = 50MB   # bytes per second when no large copy was measured
-$script:MinCopyForSpeed  = 10GB   # smaller copies don't measure the speed: listing the folders dominates them
+$script:MinCopyForSpeed  = 10GB   # smaller copies are too short to measure a reliable speed
 
 # ConvertFrom-TimesDuration: "hh:mm:ss" -> TimeSpan; anything else -> $null.
 function ConvertFrom-TimesDuration {
@@ -521,15 +521,14 @@ function Format-ApproxDuration {
 
 # Get-EntrySpeed: the copy speed (bytes per second) one past run measured, or
 # $null if it can't tell: only successful runs ("OK...") that copied at least
-# 10 GB count, and the dry run's time (an approximation of the time robocopy
-# spends listing the folders) is taken out of the copy's time.
+# 10 GB count. The dry run's time isn't taken out: the copy starts right after
+# the dry run has read the folders, so going through them again takes seconds.
 function Get-EntrySpeed {
     param($Entry)
     if ($Entry.Status -notmatch '^OK') { return $null }
     if ($null -eq $Entry.CopiedBytes -or $Entry.CopiedBytes -lt $script:MinCopyForSpeed) { return $null }
     if ($null -eq $Entry.Copy) { return $null }
     $seconds = $Entry.Copy.TotalSeconds
-    if ($null -ne $Entry.DryRun) { $seconds -= $Entry.DryRun.TotalSeconds }
     if ($seconds -le 0) { return $null }
     return ($Entry.CopiedBytes / $seconds)
 }
@@ -558,16 +557,15 @@ function Get-CopySpeed {
 }
 
 # Get-CopyEstimateText: the confirmation screen's estimate of the copy time:
-# this run's dry-run time (the listing) plus the bytes to copy at the speed
-# from Get-CopySpeed.
+# the bytes to copy at the speed from Get-CopySpeed.
 function Get-CopyEstimateText {
-    param($Stats, [TimeSpan]$DryRunDuration, $Entries, [string]$Source, [string]$Dest, [bool]$FirstBackup)
+    param($Stats, $Entries, [string]$Source, [string]$Dest, [bool]$FirstBackup)
     $prefix = if ($FirstBackup) { "First backup to $Dest. " } else { '' }
     if ($null -eq $Stats) {
         return $prefix + "The copy time can't be estimated: the dry run's counts are unknown."
     }
     $speed = Get-CopySpeed $Entries $Source $Dest
-    $estimate = [TimeSpan]::FromSeconds($DryRunDuration.TotalSeconds + ($Stats.CopyBytes / $speed.BytesPerSecond))
+    $estimate = [TimeSpan]::FromSeconds($Stats.CopyBytes / $speed.BytesPerSecond)
     $size = Format-Size $Stats.CopyBytes
     $rate = ('{0:N1}' -f ($speed.BytesPerSecond / 1MB)) + ' MB/s'
     switch ($speed.Basis) {

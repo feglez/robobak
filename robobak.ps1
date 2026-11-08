@@ -484,7 +484,7 @@ Write-DryRunList -DryRun $DryRun -Path $DryRunTempList -SourceText "$Source ($So
 Write-Host "Dry run finished in $($DryRun.Duration.ToString('hh\:mm\:ss'))." -ForegroundColor Cyan
 $DryRunCounts = Format-DryRunCounts $DryRun.Stats
 $LargeDeletion = Test-LargeDeletion $DryRun.Stats $Settings
-$CopyEstimate = Get-CopyEstimateText -Stats $DryRun.Stats -DryRunDuration $DryRun.Duration -Entries $TimesEntries -Source $SourceLabel -Dest $DestLabel -FirstBackup $FirstBackup
+$CopyEstimate = Get-CopyEstimateText -Stats $DryRun.Stats -Entries $TimesEntries -Source $SourceLabel -Dest $DestLabel -FirstBackup $FirstBackup
 
 # --- 5. USER CONFIRMATION ---
 
