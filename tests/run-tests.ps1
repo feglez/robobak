@@ -786,13 +786,15 @@ try {
 
     $speed = Get-CopySpeed $entries 'DATA' 'BACKUP_1'
     Assert-Equal 'pair' $speed.Basis "speed: the last large copy to the same drive"
-    Assert-Equal ([math]::Round(200 * 1GB / 6000)) ([math]::Round($speed.BytesPerSecond)) "speed = copied bytes / (copy time - dry run time)"
+    Assert-Equal ([math]::Round(200 * 1GB / 6120)) ([math]::Round($speed.BytesPerSecond)) "speed = copied bytes / copy time, with the dry run's time left in"
     $speed = Get-CopySpeed $entries 'DATA' 'BACKUP_2'
     Assert-Equal 'source|BACKUP_1' "$($speed.Basis)|$($speed.Dest)" "speed: FAILED, small (< 10 GB) and unknown copies are skipped, so another drive's copy is used"
     $speed = Get-CopySpeed $entries 'OTHER' 'BACKUP_1'
     Assert-Equal ('default|' + (50 * 1MB)) "$($speed.Basis)|$($speed.BytesPerSecond)" "speed: no large copy from this source, so the 50 MB/s default"
-    $neg = [pscustomobject]@{ Status = 'OK'; CopiedBytes = 20GB; Copy = [TimeSpan]::FromMinutes(1); DryRun = [TimeSpan]::FromMinutes(2) }
-    Assert-True ($null -eq (Get-EntrySpeed $neg)) "speed: a copy shorter than its dry run measures nothing"
+    $shortCopy = [pscustomobject]@{ Status = 'OK'; CopiedBytes = 20GB; Copy = [TimeSpan]::FromMinutes(1); DryRun = [TimeSpan]::FromMinutes(2) }
+    Assert-Equal ([math]::Round(20GB / 60)) ([math]::Round((Get-EntrySpeed $shortCopy))) "speed: a copy shorter than its dry run still measures a speed"
+    $zeroCopy = [pscustomobject]@{ Status = 'OK'; CopiedBytes = 20GB; Copy = [TimeSpan]::Zero; DryRun = [TimeSpan]::FromMinutes(2) }
+    Assert-True ($null -eq (Get-EntrySpeed $zeroCopy)) "speed: a copy with no recorded time measures nothing"
     $noDry = [pscustomobject]@{ Status = 'OK'; CopiedBytes = 20GB; Copy = [TimeSpan]::FromMinutes(10); DryRun = $null }
     Assert-Equal ([math]::Round(20GB / 600)) ([math]::Round((Get-EntrySpeed $noDry))) "speed: without a dry run, the whole copy time"
 
@@ -802,16 +804,19 @@ try {
     Assert-Equal 'about 2 h 35 min' (Format-ApproxDuration ([TimeSpan]::FromMinutes(155))) "155 min: about 2 h 35 min"
 
     $stats = [pscustomobject]@{ DeleteFiles = 0; DeleteBytes = 0; CopyFiles = 10; CopyBytes = 200 * 1GB; FailedFiles = 0 }
-    $text = Get-CopyEstimateText -Stats $stats -DryRunDuration ([TimeSpan]::FromMinutes(2)) -Entries $entries -Source 'DATA' -Dest 'BACKUP_1' -FirstBackup $false
-    Assert-Contains $text "Estimated copy time: about 1 h 42 min (" "estimate = dry run + bytes / speed"
+    $text = Get-CopyEstimateText -Stats $stats -Entries $entries -Source 'DATA' -Dest 'BACKUP_1' -FirstBackup $false
+    Assert-Contains $text "Estimated copy time: about 1 h 42 min (" "estimate = bytes / speed"
     Assert-Contains $text "measured on the last large copy to BACKUP_1)" "estimate names the copy it measured"
     Assert-NotContains $text "First backup" "no first-backup prefix for a known drive"
-    $text = Get-CopyEstimateText -Stats $stats -DryRunDuration ([TimeSpan]::FromMinutes(2)) -Entries $entries -Source 'DATA' -Dest 'BACKUP_3' -FirstBackup $true
+    $tiny = [pscustomobject]@{ DeleteFiles = 0; DeleteBytes = 0; CopyFiles = 2; CopyBytes = 2253; FailedFiles = 0 }
+    $text = Get-CopyEstimateText -Stats $tiny -Entries $entries -Source 'DATA' -Dest 'BACKUP_1' -FirstBackup $false
+    Assert-Contains $text "Estimated copy time: less than a minute (" "a tiny copy is estimated at less than a minute (a real 2.2 KB run took 4 s)"
+    $text = Get-CopyEstimateText -Stats $stats -Entries $entries -Source 'DATA' -Dest 'BACKUP_3' -FirstBackup $true
     Assert-True ($text.StartsWith('First backup to BACKUP_3. Estimated copy time: ')) "first backup to a drive is said first"
     Assert-Contains $text "measured on a copy to BACKUP_1)" "a new drive borrows another drive's speed"
-    $text = Get-CopyEstimateText -Stats $stats -DryRunDuration ([TimeSpan]::FromMinutes(2)) -Entries $entries -Source 'OTHER' -Dest 'BACKUP_1' -FirstBackup $false
+    $text = Get-CopyEstimateText -Stats $stats -Entries $entries -Source 'OTHER' -Dest 'BACKUP_1' -FirstBackup $false
     Assert-Contains $text "at 50 MB/s, a default: no large copy measured yet)" "without measurements, the default speed is said"
-    $text = Get-CopyEstimateText -Stats $null -DryRunDuration ([TimeSpan]::FromMinutes(2)) -Entries $entries -Source 'DATA' -Dest 'BACKUP_1' -FirstBackup $false
+    $text = Get-CopyEstimateText -Stats $null -Entries $entries -Source 'DATA' -Dest 'BACKUP_1' -FirstBackup $false
     Assert-Contains $text "can't be estimated" "unknown counts: no estimate"
 
     Assert-Equal 'Last time to BACKUP_2 it took 00:01:00.' (Get-DryRunHintText $entries 'DATA' 'BACKUP_2') "dry-run hint: the last dry run to the same drive"
