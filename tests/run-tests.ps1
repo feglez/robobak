@@ -438,12 +438,14 @@ try {
     }
 
     # The original script's copy and verification commands (commit c99c724),
-    # unchanged, run directly on a twin fixture to get the reference logs.
+    # run directly on a twin fixture to get the reference logs. The one deliberate
+    # change since then: robobak_health (the disk health history) is excluded too.
     function Invoke-OriginalCommands {
         param($Fx, [string[]]$ModeFlags, [switch]$Verify)
         $Source = $Fx.Src + '\'
         $Dest = $Fx.Dst + '\'
         $DestLogsDir = Join-Path $Dest 'current_backup_logs'
+        $DestHealthDir = Join-Path $Dest 'robobak_health'
         $SourceLogsDir = Join-Path $Source 'backup_logs'
         $DestBackupLogsDir = Join-Path $Dest 'backup_logs'
         New-Item -ItemType Directory -Path $DestLogsDir, $SourceLogsDir -Force | Out-Null
@@ -452,11 +454,11 @@ try {
         $RoboCommon = @(
             "/MIR", "/MT:16", "/DCOPY:DAT", "/R:3", "/W:5", "/V",
             "/LOG+:$LogRobo",
-            "/XD", '$RECYCLE.BIN', "System Volume Information", $DestLogsDir
+            "/XD", '$RECYCLE.BIN', "System Volume Information", $DestLogsDir, $DestHealthDir
         )
         & robocopy $Source $Dest @RoboCommon @ModeFlags > $null
         if ($Verify) {
-            & robocopy $Source $Dest /MIR /L /MT:16 /R:3 /W:5 /LOG+:$LogVerify /XD '$RECYCLE.BIN' "System Volume Information" $DestLogsDir $SourceLogsDir $DestBackupLogsDir > $null
+            & robocopy $Source $Dest /MIR /L /MT:16 /R:3 /W:5 /LOG+:$LogVerify /XD '$RECYCLE.BIN' "System Volume Information" $DestLogsDir $DestHealthDir $SourceLogsDir $DestBackupLogsDir > $null
         }
         return @{ Copy = $LogRobo; Verify = $LogVerify }
     }
@@ -478,7 +480,7 @@ try {
         $newBlock = Get-RoboOptionsBlock (Join-Path $fxNew.Dst 'current_backup_logs\robocopy_log.txt') $fxNew.Root
         $oldBlock = Get-RoboOptionsBlock $ref.Copy $fxOld.Root
         Assert-Equal $oldBlock $newBlock "$($m.Name): the copy passes robocopy exactly the original options and exclusions"
-        Assert-Contains $out "1 Extra dir is expected" "$($m.Name): the expected-extra-dir note is still shown"
+        Assert-Contains $out "1 or 2 Extra dirs are expected" "$($m.Name): the expected-extra-dirs note is shown"
         if ($verifyArg -eq '--verify') {
             $newV = Get-RoboOptionsBlock (Join-Path $fxNew.Dst 'current_backup_logs\verify_log.txt') $fxNew.Root
             $oldV = Get-RoboOptionsBlock $ref.Verify $fxOld.Root
