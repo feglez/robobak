@@ -37,7 +37,7 @@ Where `F` is the source drive and `E` is the destination.
 
 ```
 Will delete 1.240 files (3,2 GB) and copy 37 files (412,0 MB).
-Estimated copy time: about 2 min (412,0 MB at 52,7 MB/s, measured on the last large copy to BACKUP_1)
+Estimated copy time: less than a minute (412,0 MB at 52,7 MB/s, measured on the last large copy to BACKUP_1)
 Type L to see the list, Y to continue, anything else to cancel:
 ```
 
