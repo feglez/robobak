@@ -9,7 +9,8 @@
 - Windows 10 or later
 - PowerShell 5.1 or later (included with Windows 10/11)
 - Both source and destination drives must be connected and accessible
-- `robobak.ps1` and `robobak-lib.ps1` must be in the same folder. The library holds functions shared with the tests; if it's missing, the script stops with an error before doing anything
+- `robobak.ps1`, `robobak-lib.ps1` and `robobak-health.ps1` must be in the same folder. The library holds functions shared with the tests; if it's missing, the script stops with an error before doing anything
+- Optional, for [disk health](#disk-health): smartmontools or CrystalDiskInfo, and administrator rights when the run ends
 
 ### Execution policy
 
@@ -61,6 +62,8 @@ Flags can be combined in any order after the two drive letters.
 | `--no-verify` | Skip verification without asking |
 | `--show-progress` | Show a progress bar during the backup (counts files processed vs total) |
 | `--verbose` | Show every file operation on the terminal in real-time (adds `/TEE` to robocopy) |
+| `--health` | Log [disk health](#disk-health) at the end without asking |
+| `--no-health` | Don't log disk health, and don't ask |
 | *(none)* | Clean terminal during copy; asks whether to verify afterwards |
 
 **Note:** `--show-progress` and `--verbose` cannot be used together. The progress bar requires a clean terminal, which is incompatible with the verbose file-by-file output.
@@ -111,7 +114,8 @@ Run it right after the system backup program has finished, where `S` is the part
 
 1. **Checks the letter** — the drive must be connected. A partition labeled `BACKUP_*` is **refused**: that label marks a mirror drive, and the system image partition never has one, so it most likely means the wrong letter was typed. The partition needs no particular label
 2. **Asks for confirmation** — shows the letter and label, and requires you to type `Y`
-3. **Records it** — appends one `system` line to `local\runs.csv` (see [Script folder](#script-folder-local)), with the computer's name as the source and the partition's label as the destination
+3. **Logs the partition's disk health** — optional, see [Disk health](#disk-health). `--health` or `--no-health` after the letter answer the question in advance
+4. **Records it** — appends one `system` line to `local\runs.csv` (see [Script folder](#script-folder-local)), with the computer's name as the source and the partition's label as the destination
 
 It **never copies or deletes anything**, runs no Robocopy, and doesn't check the backup itself: checking it is the backup program's job.
 
@@ -125,11 +129,12 @@ It **never copies or deletes anything**, runs no Robocopy, and doesn't check the
 6. **Checks disk space** — compares the source's used space against the destination's total size. If the source is larger, warns the user that the backup will be incomplete and lets them choose to continue or cancel. The comparison uses total size (not free space) because `/MIR` deletes extras on the destination during the copy, freeing space
 7. **Prepares log folders** — ensures the source `backup_logs\` folder exists. Deletes and recreates the destination `current_backup_logs\` folder to clear any stale logs from a previous run (prevents inconsistent state if the backup fails). Then moves the dry run's list and log into it, as `dry_run_list.txt` and `dry_run_log.txt`
 8. **Runs Robocopy in mirror mode** — copies all files from source to destination; files on the destination that don't exist on the source are **deleted**. By default the terminal stays clean (individual files are only logged to `robocopy_log.txt`). With `--show-progress`, files are counted first (the counting time is logged separately), then a progress bar is displayed. With `--verbose`, every file operation is printed to the terminal. A summary table and the copy duration are displayed at the end in all modes
-9. **Writes a summary** — saves a `backup_summary.txt` on the destination with the status (success or failure), date, source/destination info, Robocopy exit code, the dry run's counts and duration, file count duration, copy duration, flags used, and any errors found in the log. If Robocopy reported critical errors (exit code 8+), the script stops after writing the summary, updating the timing log and recording the run (step 13)
+9. **Writes a summary** — saves a `backup_summary.txt` on the destination with the status (success or failure), date, source/destination info, Robocopy exit code, the dry run's counts and duration, file count duration, copy duration, flags used, and any errors found in the log. If Robocopy reported critical errors (exit code 8+), the script stops after writing the summary, updating the timing log and recording the run (step 14)
 10. **Updates the backup history** — maintains a `backup_history.txt` on the source drive tracking all backup disks, marking the `[NEWEST]` and `[OLDEST]` entries
-11. **Optional verification** — asks if you want to verify the backup. If accepted, runs robocopy in list-only mode (`/L`) with multithreading (`/MT:16`) and retry limits (`/R:3 /W:5`) to compare source and destination without modifying anything. The `current_backup_logs` folder (destination-only, written after the copy) and `backup_logs` folder (on both source and destination — updated on the source after the copy, and its destination copy must also be excluded since `/XD` matches exact paths) are excluded from the comparison to avoid false differences. Note: `/XD` prevents excluded directories from being logged and compared at the file level, but robocopy still counts them as "EXTRA" in its stats table, which makes the exit code non-zero (2) even when the backup is a perfect match. To work around this, verification is considered successful when either the exit code is 0 or the exit code is 2 with no actual `EXTRA` lines in the log (case-sensitive — `EXTRA` is a robocopy constant, not translated). Reports whether the backup is a perfect match or if differences were found. The result and verification duration are appended to `backup_summary.txt`. How long the last verification to the same drive took is shown just before the question, or under "Verifying backup integrity..." with `--verify`
+11. **Optional verification** — asks if you want to verify the backup. If accepted, runs robocopy in list-only mode (`/L`) with multithreading (`/MT:16`) and retry limits (`/R:3 /W:5`) to compare source and destination without modifying anything. The `current_backup_logs` and `robobak_health` folders (destination-only) and the `backup_logs` folder (on both source and destination — updated on the source after the copy, and its destination copy must also be excluded since `/XD` matches exact paths) are excluded from the comparison to avoid false differences. Note: `/XD` prevents excluded directories from being logged and compared at the file level, but robocopy still counts them as "EXTRA" in its stats table, which makes the exit code non-zero (2) even when the backup is a perfect match. To work around this, verification is considered successful when either the exit code is 0 or the exit code is 2 with no actual `EXTRA` lines in the log (case-sensitive — `EXTRA` is a robocopy constant, not translated). Reports whether the backup is a perfect match or if differences were found. The result and verification duration are appended to `backup_summary.txt`. How long the last verification to the same drive took is shown just before the question, or under "Verifying backup integrity..." with `--verify`
 12. **Updates timing log** — writes a timing entry to `backup_times.txt` on the source drive with the dry run duration, file count duration (if `--show-progress` was used), copy duration, the size the dry run said would be copied, verification duration, and flags used. The next runs read these to estimate their times
-13. **Records the run** — appends one line to `local\runs.csv`, next to the script, with the date, both labels, the result (`ok` or `failed`) and the verification result. This happens once at the end of **every run that ran the copy**: a failed copy, a run without verification, a verified run, and a run whose verification found differences. A run cancelled at a prompt, or refused before the copy, writes nothing. If the line can't be written (for example, the file is open in Excel), a yellow warning says so and the run still ends normally. See [Script folder](#script-folder-local)
+13. **Logs disk health** — optional: asks, then reads the disks used through an administrator prompt, writes a line on each drive, and shows any warning. Done after verification, so the line knows the run's result. See [Disk health](#disk-health)
+14. **Records the run** — appends one line to `local\runs.csv`, next to the script, with the date, both labels, the result (`ok` or `failed`), the verification result and the disk health result. This happens once at the end of **every run that ran the copy**: a failed copy, a run without verification, a verified run, and a run whose verification found differences. A run cancelled at a prompt, or refused before the copy, writes nothing. If the line can't be written (for example, the file is open in Excel), a yellow warning says so and the run still ends normally. See [Script folder](#script-folder-local)
 
 ## Generated files
 
@@ -141,6 +146,7 @@ All log files are organized into dedicated folders instead of the drive root.
 |------|-------------|
 | `backup_history.txt` | List of all backup drives used, sorted by name, with `[NEWEST]` and `[OLDEST]` tags. Each drive label appears **only once** — if you back up to the same drive twice, its entry is updated with the latest date (not duplicated) |
 | `backup_times.txt` | Rolling log of the last 10 backups with timing information (dry run duration, file count duration, copy duration, copied size, verification duration, flags used), which the [time estimates](#time-estimates) read. The **first entry is the oldest** and the **last entry is the newest**. When the 11th backup is added, the oldest entry is removed |
+| `disk_health.txt`, `disk_link.json` | This drive's [disk health](#disk-health) history, and which disk holds it. Being in `backup_logs\`, they also reach the backup drives with the mirror |
 
 ### Destination drive (`current_backup_logs\`)
 
@@ -152,11 +158,18 @@ All log files are organized into dedicated folders instead of the drive root.
 | `dry_run_list.txt` | The list shown by `L` at the confirmation: the dry run's counts, then every file the mirror would delete (folders deleted with their contents are marked `[folder]`, and their files follow), then every file it would copy (new or changed). UTF-8, so accented names display correctly |
 | `dry_run_log.txt` | Full Robocopy report of the dry run (list-only), converted to UTF-8. Robocopy writes it with `/UNILOG` so accented paths survive |
 
+### Destination drive and system image partition (`robobak_health\`)
+
+| File | Description |
+|------|-------------|
+| `disk_health.txt` | One line per [disk health](#disk-health) check of this drive. Never wiped: the folder is excluded from the mirror and from the verification |
+| `disk_link.json` | Which disk holds this drive (its serial) and the year you got it. Only on volumes Windows can't match to a disk by itself, such as VeraCrypt volumes |
+
 ### Script folder (`local\`)
 
 | File | Description |
 |------|-------------|
-| `runs.csv` | One line per backup: every mirror run that ran the copy (step 13) and every system backup recorded with `--system-done`. Lines are only ever appended, never rewritten. Created, with its header, the first time a line is written |
+| `runs.csv` | One line per backup: every mirror run that ran the copy (step 14) and every system backup recorded with `--system-done`. Lines are only ever appended, never rewritten. Created, with its header, the first time a line is written |
 | `settings.json` | Optional, written by you: the red warning's thresholds (see [Settings](#settings)). RoboBak never creates it |
 
 `runs.csv` columns:
@@ -169,7 +182,7 @@ All log files are organized into dedicated folders instead of the drive root.
 | `destination` | The destination drive's label, or the system image partition's label |
 | `result` | `ok` or `failed` (Robocopy exit code 8 or more) |
 | `verification` | `passed`, `differences` or `not performed`. Always `not performed` for a system backup |
-| `health` | `not checked` for now; reserved for a disk health result |
+| `health` | `ok`, `yellow`, `red`, `not approved`, or `not checked` (no tool installed, or no disk could be read). With two disks, the worst of those that were read. See [Disk health](#disk-health) |
 
 The file is UTF-8 (with a byte order mark, so Excel and PowerShell read accents correctly). The header is plain, and every value is quoted, so labels with commas or quotes are kept intact. To read it in PowerShell: `Import-Csv .\local\runs.csv -Encoding UTF8`.
 
@@ -177,10 +190,10 @@ The file is UTF-8 (with a byte order mark, so Excel and PowerShell read accents 
 
 ```
 date,kind,source,destination,result,verification,health
-"2026-02-08 14:22:45","mirror","MY_DATA","BACKUP_2","ok","passed","not checked"
-"2026-02-09 09:15:30","mirror","MY_DATA","BACKUP_1","ok","not performed","not checked"
-"2026-02-09 10:02:11","system","LAPTOP","SYSIMG_1","ok","not performed","not checked"
-"2026-02-23 18:40:03","mirror","MY_DATA","BACKUP_2","failed","not performed","not checked"
+"2026-02-08 14:22:45","mirror","MY_DATA","BACKUP_2","ok","passed","ok"
+"2026-02-09 09:15:30","mirror","MY_DATA","BACKUP_1","ok","not performed","not approved"
+"2026-02-09 10:02:11","system","LAPTOP","SYSIMG_1","ok","not performed","yellow"
+"2026-02-23 18:40:03","mirror","MY_DATA","BACKUP_2","failed","not performed","red"
 ```
 
 ### Temporary files (`%TEMP%`)
@@ -260,7 +273,10 @@ Settings are optional and live in `local\settings.json`, in the folder that hold
 {
   "robobak": {
     "deleteWarnFiles": 500,
-    "deleteWarnGB": 5
+    "deleteWarnGB": 5,
+    "healthWarnHours": 20000,
+    "healthWarnYears": 5,
+    "healthWarnTempC": 50
   }
 }
 ```
@@ -269,10 +285,90 @@ Settings are optional and live in `local\settings.json`, in the folder that hold
 |-----|---------|---------|
 | `deleteWarnFiles` | `500` | The confirmation shows the red warning when **more** than this many files would be deleted |
 | `deleteWarnGB` | `5` | The same, for size: more than this many GB (1 GB = 1024³ bytes). Decimals are allowed, e.g. `0.5` |
+| `healthWarnHours` | `20000` | [Disk health](#disk-health): yellow warning above this many power-on hours |
+| `healthWarnYears` | `5` | Disk health: yellow warning for a disk older than this many years. Only for disks whose year you gave |
+| `healthWarnTempC` | `50` | Disk health: yellow warning above this temperature at the end of the run, in °C |
 
 - **RoboBak only reads this file and never creates it.** A missing file, section or key means the default.
 - **Invalid values** (negative numbers, text, broken JSON) are reported in yellow before the confirmation screen, and the defaults are used instead.
 - **`local\` is ignored by Git** (`.gitignore`), so it's never committed. Beware: `git clean -x` deletes ignored files, including `local\` (see [The local folder](#the-local-folder)).
+
+## Disk health
+
+At the end of a mirror run, and of `--system-done`, RoboBak can log the health of the disks it used. It's optional. Without smartmontools or CrystalDiskInfo, RoboBak says so in one line, asks nothing and writes nothing on the drives.
+
+### What happens
+
+1. **It asks** `Log disk health? This needs admin rights.` `--health` and `--no-health` answer in advance.
+2. **If you accept,** Windows shows its admin prompt, because reading SMART data needs it. A helper, `robobak-health.ps1`, runs with those rights, reads every connected disk once, and hands the result back through a temporary file in `%TEMP%`, which is then deleted. It only reads.
+3. **For each drive in the run** (the source and the destination, or the partition given to `--system-done`), RoboBak finds its disk, compares it with the previous line of that drive's history, writes a new line, and shows the result and any warning.
+
+**If you answer no or cancel the admin prompt,** each drive's history gets a `not approved` line and `runs.csv` says `not approved`. This step never affects the backup: anything unexpected is a yellow warning, and the run ends normally.
+
+### Which disk is which
+
+- **A plain partition** is matched through Windows (drive letter, then disk number).
+- **A VeraCrypt volume** can't be, so the first time RoboBak lists the disks as the tool reports them (model, serial, size) and asks which one holds it, and the year you got it (optional). It saves that in `disk_link.json` on the drive, so it travels with the drive. Later runs match the disk by its serial.
+- **If you move a volume to another disk,** delete its `disk_link.json` and RoboBak will ask again.
+- **Two volumes on one disk** have two histories, one on each volume, and each line is compared with the previous line in the same file.
+
+### Tools
+
+RoboBak uses smartmontools, and CrystalDiskInfo for any disk smartmontools can't read. It calls them by their default paths, so install them in their default folders.
+
+**smartmontools:**
+1. Download `smartmontools-<version>.win32-setup.exe` from the [releases page](https://github.com/smartmontools/smartmontools/releases). It installs the 64-bit program on 64-bit Windows.
+2. Run it with the default options. RoboBak expects `C:\Program Files\smartmontools\bin\smartctl.exe`.
+3. To check it, run this in PowerShell as administrator; your disks should be listed:
+   ```powershell
+   & "C:\Program Files\smartmontools\bin\smartctl.exe" --scan-open
+   ```
+
+To uninstall it: **Settings > Apps > Installed apps > smartmontools > Uninstall**.
+
+**CrystalDiskInfo:**
+1. Install it with its standard installer. RoboBak expects `C:\Program Files\CrystalDiskInfo\DiskInfo64.exe`.
+2. To check it, open it and see that your disks are listed.
+
+To uninstall it: **Settings > Apps > Installed apps > CrystalDiskInfo > Uninstall**. Each time RoboBak uses it, it writes `DiskInfo.txt` next to its executable.
+
+### What it creates
+
+| Where | What | Removing it |
+|-------|------|-------------|
+| Source drive, `backup_logs\` | `disk_health.txt`, `disk_link.json` | Loses that drive's history; RoboBak starts a new one |
+| Destination drive or system image partition, `robobak_health\` | `disk_health.txt`, `disk_link.json` | The same |
+| `%TEMP%` | `robobak_health_<id>.json`, the helper's result | Deleted at once by RoboBak |
+| `local\runs.csv` | The `health` column | Part of the run's record |
+
+### A line of the history
+
+```
+2026-02-08 14:22:45 | mirror | level=ok | smart=passed | 05=0 | C5=0 | C6=0 | C7=0 | hours=12034 | tempC=34 | serial=ABC123 | model=DISK MODEL | tool=smartctl | copyErrors=0 | verification=passed
+```
+
+`level` is `ok`, `yellow`, `red`, `not approved` or `not checked`. A value the tool doesn't give is `unknown`. Lines with no reading (`not approved`, `not checked`) only keep the date, the run and why.
+
+### The warnings
+
+Each reading is compared with the previous reading of the same disk in that drive's history.
+
+| Level | Sign |
+|-------|------|
+| Red | SMART status not OK |
+| Red | 05 (reallocated sectors), C5 (pending sectors) or C6 (uncorrectable sectors) rising, or above zero for the first time. On a drive's first reading, any value above zero counts as the first time |
+| Red | Copy errors (any `ERROR` line in `robocopy_log.txt`, even for a file that succeeded on a retry) or a failed copy, or a verification that found differences, in this run |
+| Yellow | 05, C5 or C6 above zero but not rising |
+| Yellow | C7 (CRC errors, usually the enclosure or the cable) rising |
+| Yellow | Power-on hours above `healthWarnHours` (20,000) |
+| Yellow | Older than `healthWarnYears` (5 years), when you gave the year |
+| Yellow | Temperature at the end above `healthWarnTempC` (50 °C) |
+
+The thresholds are in [Settings](#settings).
+
+**Limits:**
+- **NVMe disks** have no 05, C5, C6 or C7, so those rules don't apply to them.
+- **Through CrystalDiskInfo,** the SMART status is `unknown` unless its report says `Good` or `Bad`, because the word is translated into CrystalDiskInfo's language. The attribute rules still apply.
 
 ## Time estimates
 
@@ -304,7 +400,7 @@ RoboBak reads how long past runs took from `backup_times.txt` on the source driv
 | `/LOG+` | Appends the full output to `robocopy_log.txt` on the destination. Uses append mode (`+`) to preserve the descriptive header that the script writes to the file before launching robocopy |
 | `/TEE` | Only with `--show-progress` or `--verbose`. Sends output to both the log file and the terminal (stdout) |
 | `/NP` | Only with `--show-progress`. Suppresses the per-file progress percentages (0%..100%) that `/MT:16` adds to each file line (empirically confirmed). Without it, these percentages would inflate the file count used by the progress bar |
-| `/XD` | Excludes **directories**: `$RECYCLE.BIN` and `System Volume Information` are excluded by name (Windows system folders that cannot be copied — these names are reserved by Windows, so name-based matching is safe). `current_backup_logs` is excluded by full path (destination-only folder with script-generated logs — full path prevents accidentally excluding user folders with the same name). The dry run uses exactly the same list as the copy, so its counts match. During verification, `backup_logs` is excluded by full path on both source and destination (updated on source after the copy; the destination copy must also be excluded since `/XD` matches exact paths — without it, the destination's `backup_logs` would appear as an extra directory) |
+| `/XD` | Excludes **directories**: `$RECYCLE.BIN` and `System Volume Information` are excluded by name (Windows system folders that cannot be copied — these names are reserved by Windows, so name-based matching is safe). `current_backup_logs` and `robobak_health` are excluded by full path (destination-only folders: script-generated logs and the drive's [disk health](#disk-health) history, which `/MIR` would otherwise delete — full path prevents accidentally excluding user folders with the same name). The dry run uses exactly the same list as the copy, so its counts match. During verification, `backup_logs` is excluded by full path on both source and destination (updated on source after the copy; the destination copy must also be excluded since `/XD` matches exact paths — without it, the destination's `backup_logs` would appear as an extra directory) |
 
 ### Dry run flags
 
@@ -376,9 +472,10 @@ Each check prints `PASS` or `FAIL`, and the script ends with `Passed: N  Failed:
 - **A real list-only robocopy** on test folders with every kind of difference: a changed file, new files, deleted files, a deleted folder with a nested folder, and accented names. The counts and the list must match exactly, and both folders must be left untouched.
 - **`robobak.ps1` end to end,** with the answers to its prompts piped in: cancelling leaves everything byte-identical, `L` then `Y` mirrors and keeps the dry run's files, a second run verifies, 501 deleted files trigger the red warning, and a wrong letter or label is refused before any robocopy runs.
 - **Behaviour kept from before the dry run existed:** for the default mode, `--show-progress` and `--verbose`, and for the verification, robocopy's echo of its own options (source, destination, excluded folders and flags) must match exactly what the original commands produce on an identical pair of folders. They also cover the verify question when no flag is given, the refusals (`--show-progress` with `--verbose`, the same letter twice), the help, the warning for a source without a label, and a failed copy (a locked file): `BACKUP FAILED`, the error in the summary, the failed entry in `backup_times.txt`, and no history update.
+- **Disk health:** smartctl's and CrystalDiskInfo's output parsed from recorded examples, the history file, every red and yellow rule, the first reading, a saved disk that isn't connected, cancelling the admin prompt, `--health` and `--no-health`, no tool installed, and a mirror keeping the history.
 - **Backup records:** one `runs.csv` line per run that ran the copy (verified, not verified, verify question answered N, failed), none for cancelled or refused runs, the header written once, the byte order mark, and labels with quotes, commas and accents surviving `Import-Csv`. `--system-done`: `Y` records one `system` line, `N` records nothing, an unmapped letter, a missing letter and a `BACKUP_` label are refused, and nothing is copied or changed on any folder. The tests check at the end that the repo's own `local\runs.csv` was never touched.
 
-**What they can't prove:** they use NTFS folders on the computer's own disk, not exFAT or VeraCrypt drives over USB, so the label fallback for VeraCrypt volumes, real timings and drive-specific behaviour still need a run on real drives.
+**What they can't prove:** they use NTFS folders on the computer's own disk, not exFAT or VeraCrypt drives over USB, so the label fallback for VeraCrypt volumes, real timings and drive-specific behaviour still need a run on real drives. Disk health uses recorded data instead of the tools and runs the helper without administrator rights, so the real admin prompt and the real tools' output also need a run on real drives.
 
 ### Test mode
 
@@ -390,6 +487,7 @@ F=C:\Temp\rb\src|DATA;E=C:\Temp\rb\dst|BACKUP_TEST;local=C:\Temp\rb\local
 
 - **`<letter>=<folder>|<label>`** is a fake drive. A letter that isn't in the map is an error, never a real drive.
 - **`local=<folder>`** replaces the `local\` folder, for both the settings and `runs.csv`. Without it, test mode uses the default settings, records nothing (it says so on screen), and never touches the real `local\`.
+- **`health=<folder>`** holds recorded disk health data instead of the tools and Windows: `pd<N>.json` and `pd<N>.sat.json` (what `smartctl -a -j` prints for disk N, without and with `-d sat`), `DiskInfo.txt` (CrystalDiskInfo's report), `disk_of_<LETTER>.txt` (the disk number of a plain partition) and `cancel_elevation.txt` (simulates cancelling the admin prompt). The helper is started the same way, without elevation. Without this entry, test mode skips disk health.
 - **Folders can't contain spaces,** because robocopy misreads a quoted path that ends in a backslash.
 - **While it's on,** the script shows a `TEST MODE` banner, and `L` prints the list's path instead of opening Notepad.
 

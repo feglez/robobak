@@ -14,13 +14,15 @@ A PowerShell script that creates exact mirror backups of one drive onto another 
 - **Time estimates** — before the dry run and the verification, shows how long they took last time; the confirmation estimates the copy time from the amount to copy and the speed of past copies
 - **Backup records** — one line per mirror run in `local\runs.csv`, next to the script, with its result and verification
 - **System backup records** — `--system-done` records a system backup made with another program, so the records cover both kinds of backup
+- **Disk health** — optional, at the end of a run: reads the SMART data of the disks used (with smartmontools or CrystalDiskInfo), keeps a history on each drive and shows red or yellow warnings
 - **Detailed logging** — full Robocopy report, summary with errors, and verification report on the destination
 
 ## Requirements
 
 - Windows 10 or later
 - PowerShell 5.1+ (included with Windows 10/11)
-- `robobak.ps1` and `robobak-lib.ps1` in the same folder
+- `robobak.ps1`, `robobak-lib.ps1` and `robobak-health.ps1` in the same folder
+- Optional, for disk health: [smartmontools](https://github.com/smartmontools/smartmontools/releases) or CrystalDiskInfo, and administrator rights when the run ends
 
 ## Quick start
 
@@ -55,6 +57,8 @@ Numbers follow your Windows language settings (the example is from a Spanish sys
 | `--no-verify` | Skip verification without asking |
 | `--show-progress` | Show a progress bar during the backup |
 | `--verbose` | Show every file operation on the terminal |
+| `--health` | Log disk health at the end without asking |
+| `--no-health` | Don't log disk health, and don't ask |
 
 ### Examples
 
@@ -74,7 +78,7 @@ Numbers follow your Windows language settings (the example is from a Spanish sys
 .\robobak.ps1 --system-done S
 ```
 
-Records in `local\runs.csv` that a system backup (made with another program, such as a disk imaging tool) was just written to the partition at `S:`. It asks for confirmation, never copies or deletes anything, and refuses a partition labeled `BACKUP_*`, because that's a mirror drive. See [Recording a system backup](usage_guide.md#recording-a-system-backup---system-done) in the usage guide.
+Records in `local\runs.csv` that a system backup (made with another program, such as a disk imaging tool) was just written to the partition at `S:`. It asks for confirmation, never copies or deletes anything, and refuses a partition labeled `BACKUP_*`, because that's a mirror drive. It can log that partition's disk health too (`--health` or `--no-health` answer in advance). See [Recording a system backup](usage_guide.md#recording-a-system-backup---system-done) in the usage guide.
 
 ## Generated files
 
@@ -82,16 +86,22 @@ Records in `local\runs.csv` that a system backup (made with another program, suc
 |----------|------|-------------|
 | Source `backup_logs\` | `backup_history.txt` | List of all backup drives with `[NEWEST]`/`[OLDEST]` tags |
 | Source `backup_logs\` | `backup_times.txt` | Rolling log of the last 10 backups with timing info, also used for the time estimates |
+| Source `backup_logs\` | `disk_health.txt`, `disk_link.json` | This drive's disk health history, and which disk holds it |
 | Dest `current_backup_logs\` | `robocopy_log.txt` | Full Robocopy technical report |
 | Dest `current_backup_logs\` | `backup_summary.txt` | Status, date, errors, timing, and verification result |
 | Dest `current_backup_logs\` | `verify_log.txt` | Verification comparison report (only if requested) |
 | Dest `current_backup_logs\` | `dry_run_list.txt` | What the dry run listed: files to delete, then files to copy |
 | Dest `current_backup_logs\` | `dry_run_log.txt` | Full Robocopy report of the dry run |
+| Dest or image partition `robobak_health\` | `disk_health.txt`, `disk_link.json` | That drive's disk health history, and which disk holds it. Kept between runs |
 | Script folder `local\` | `runs.csv` | One line per mirror run and per recorded system backup |
+
+## Disk health
+
+At the end of a run, RoboBak asks `Log disk health? This needs admin rights.` If you accept, it reads the disks used through Windows' admin prompt, compares them with each drive's history, and shows any warning. Without smartmontools or CrystalDiskInfo it says so in one line, asks nothing and writes nothing on the drives. See [Disk health](usage_guide.md#disk-health) in the usage guide, including how to install and uninstall both tools.
 
 ## The `local\` folder
 
-`local\` sits next to the script and holds what only this computer knows: `runs.csv` (the backup records) and, optionally, `settings.json` (the red warning's thresholds, which RoboBak only reads and never creates). It's ignored by Git, so it's never committed, but `git clean -x` would delete it. To keep the records when you reinstall Windows or move to another computer, copy the whole folder and put it back next to the script. See [The local folder](usage_guide.md#the-local-folder) in the usage guide.
+`local\` sits next to the script and holds what only this computer knows: `runs.csv` (the backup records) and, optionally, `settings.json` (the warnings' thresholds, which RoboBak only reads and never creates). It's ignored by Git, so it's never committed, but `git clean -x` would delete it. To keep the records when you reinstall Windows or move to another computer, copy the whole folder and put it back next to the script. See [The local folder](usage_guide.md#the-local-folder) in the usage guide.
 
 ## Tests
 
