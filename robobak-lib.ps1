@@ -1132,7 +1132,8 @@ function Get-SuggestedDrive {
 # Get-ReminderItem: the state of one kind of backup: the last time it was done
 # (result "ok") and skipped, when the next one is due, and whether it's due now.
 # The interval counts from the last done-or-skipped record. A backup with no
-# record is due. AgeDays is always the age of the last backup actually done.
+# record is due. AgeDays is always the age of the last backup actually done, in
+# calendar days, so yesterday evening is "1 day ago" even under 24 hours later.
 function Get-ReminderItem {
     param($Records, [string]$Kind, [double]$IntervalDays, [datetime]$Now)
     $list = @(Get-DatedRecords $Records $Kind)
@@ -1143,7 +1144,7 @@ function Get-ReminderItem {
     $base = $lastDone
     if ($null -ne $lastSkipped -and ($null -eq $base -or $lastSkipped -gt $base)) { $base = $lastSkipped }
     $nextDue = if ($null -ne $base) { $base.AddDays($IntervalDays) } else { $null }
-    $age = if ($null -ne $lastDone) { [int][math]::Max(0, [math]::Floor(($Now - $lastDone).TotalDays)) } else { $null }
+    $age = if ($null -ne $lastDone) { [int][math]::Max(0, ($Now.Date - $lastDone.Date).Days) } else { $null }
     return [pscustomobject][ordered]@{
         Kind = $Kind; LastDone = $lastDone; LastSkipped = $lastSkipped; NextDue = $nextDue
         Due = ($null -eq $nextDue -or $Now -ge $nextDue); AgeDays = $age; SuggestedDrive = $null

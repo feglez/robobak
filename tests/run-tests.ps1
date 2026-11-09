@@ -1280,6 +1280,11 @@ C7 200 200 _0 0000000000FF Errores CRC
     Assert-Equal ([datetime]'2026-06-24 12:00:00') $st.System.NextDue "next due is the interval after it"
     Assert-True ($st.Mirror.Due) "the two kinds are independent"
 
+    $st = Get-ReminderStatus -Records @(New-Rec '2026-06-14 21:39:39' 'system') -Settings $rs -Now ([datetime]'2026-06-15 20:42:00')
+    Assert-Equal 1 $st.System.AgeDays "the age counts calendar days: yesterday evening is 1 day ago, even less than 24 hours later"
+    $st = Get-ReminderStatus -Records @(New-Rec '2026-06-15 01:00:00' 'system') -Settings $rs -Now ([datetime]'2026-06-15 23:00:00')
+    Assert-Equal 0 $st.System.AgeDays "earlier the same day has age 0"
+
     $st = Get-ReminderStatus -Records @(New-Rec '2026-06-01 12:00:00' 'system') -Settings $rs -Now $now
     Assert-True ($st.System.Due) "exactly the interval: due"
     $st = Get-ReminderStatus -Records @(New-Rec '2026-06-01 12:00:01' 'system') -Settings $rs -Now $now
