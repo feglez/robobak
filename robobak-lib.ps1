@@ -973,3 +973,413 @@ function Get-OverallHealth {
     }
     return 'not checked'
 }
+
+# --- REMINDERS ---
+
+# The reminders read local\runs.csv and work out what's due. Two scripts use
+# these functions: robobak-reminders.ps1 (the window, and -Check, which a
+# scheduled task runs) and install-reminders.ps1. The settings are the
+# "reminders" section of local\settings.json; only the window writes it.
+# local\state.json keeps when the last notification was shown.
+#
+# In test mode, -Check prints what it would notify instead of showing a
+# notification, a file named locked.txt in the "local=" folder means the screen
+# is locked, and nothing is registered with Task Scheduler.
+
+$script:ReminderTaskName     = 'RoboBak reminders'
+$script:ReminderAppId        = 'RoboBak.Reminders'
+$script:ReminderShortcutName = 'RoboBak.lnk'
+
+# Read-ReminderSettings: the "reminders" section of local\settings.json. A
+# missing file, section or key means the default; a value that can't be read is
+# reported in .Warning and replaced by its default.
+#   enabled                                     reminders on or off (default on)
+#   systemDays, mirrorDays                      interval in days (default 14)
+#   gapHours                                    at most one notification per this many hours (default 24, 0 = no limit)
+#   triggerLogon, triggerUnlock, triggerDaily   when the check runs (default all on)
+#   dailyTime                                   HH:mm for the daily check (default 12:00)
+function Read-ReminderSettings {
+    param([string]$LocalDir)
+    $result = [pscustomobject][ordered]@{
+        Enabled = $true; SystemDays = 14; MirrorDays = 14; GapHours = 24
+        TriggerLogon = $true; TriggerUnlock = $true; TriggerDaily = $true; DailyTime = '12:00'
+        Warning = $null
+    }
+    if (-not $LocalDir) { return $result }
+    $file = Join-Path $LocalDir 'settings.json'
+    if (-not (Test-Path -LiteralPath $file)) { return $result }
+    try {
+        $json = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        $result.Warning = "Could not read `"$file`" (invalid JSON). Using the default reminder settings."
+        return $result
+    }
+    $section = $json.reminders
+    if ($null -eq $section) { return $result }
+    $bad = @()
+    foreach ($pair in @(@('enabled', 'Enabled'), @('triggerLogon', 'TriggerLogon'), @('triggerUnlock', 'TriggerUnlock'), @('triggerDaily', 'TriggerDaily'))) {
+        $value = $section.($pair[0])
+        if ($null -eq $value) { continue }
+        if ($value -is [bool]) { $result.($pair[1]) = $value } else { $bad += $pair[0] }
+    }
+    foreach ($pair in @(@('systemDays', 'SystemDays', 1), @('mirrorDays', 'MirrorDays', 1), @('gapHours', 'GapHours', 0))) {
+        $value = $section.($pair[0])
+        if ($null -eq $value) { continue }
+        $number = 0.0
+        if ([double]::TryParse([string]$value, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$number) -and $number -ge $pair[2]) {
+            $result.($pair[1]) = $number
+        } else {
+            $bad += $pair[0]
+        }
+    }
+    $time = $section.dailyTime
+    if ($null -ne $time) {
+        if (([string]$time) -match '^([01]\d|2[0-3]):[0-5]\d$') { $result.DailyTime = [string]$time } else { $bad += 'dailyTime' }
+    }
+    if ($bad.Count -gt 0) {
+        $result.Warning = "Ignored invalid value(s) in `"$file`": $($bad -join ', '). Using the default for those."
+    }
+    return $result
+}
+
+# Save-ReminderSettings: writes the "reminders" section of local\settings.json,
+# leaving every other section as it is. Throws, without touching the file, if
+# the file exists but isn't valid JSON.
+function Save-ReminderSettings {
+    param([string]$LocalDir, $Settings)
+    if (-not $LocalDir) { throw 'There is no local folder to save the settings to.' }
+    if (-not (Test-Path -LiteralPath $LocalDir)) { New-Item -ItemType Directory -Path $LocalDir -Force | Out-Null }
+    $file = Join-Path $LocalDir 'settings.json'
+    $json = $null
+    if (Test-Path -LiteralPath $file) {
+        $text = Get-Content -LiteralPath $file -Raw -Encoding UTF8
+        if ($text -and $text.Trim()) {
+            try { $json = $text | ConvertFrom-Json } catch { throw "`"$file`" isn't valid JSON, so it was left as it is. Fix or delete it, then save again." }
+        }
+    }
+    if ($null -eq $json) { $json = [pscustomobject]@{} }
+    $section = [pscustomobject][ordered]@{
+        enabled       = [bool]$Settings.Enabled
+        systemDays    = $Settings.SystemDays
+        mirrorDays    = $Settings.MirrorDays
+        gapHours      = $Settings.GapHours
+        triggerLogon  = [bool]$Settings.TriggerLogon
+        triggerUnlock = [bool]$Settings.TriggerUnlock
+        triggerDaily  = [bool]$Settings.TriggerDaily
+        dailyTime     = [string]$Settings.DailyTime
+    }
+    $json | Add-Member -NotePropertyName 'reminders' -NotePropertyValue $section -Force
+    [System.IO.File]::WriteAllText($file, ($json | ConvertTo-Json -Depth 8), (New-Object System.Text.UTF8Encoding($true)))
+}
+
+# ConvertFrom-RecordDate: "yyyy-MM-dd HH:mm:ss" -> a date, or $null.
+function ConvertFrom-RecordDate {
+    param([string]$Text)
+    $date = [datetime]::MinValue
+    if ([datetime]::TryParseExact($Text, 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$date)) { return $date }
+    return $null
+}
+
+# Read-ReminderState: when the last notification was shown, or $null.
+function Read-ReminderState {
+    param([string]$LocalDir)
+    if (-not $LocalDir) { return $null }
+    $file = Join-Path $LocalDir 'state.json'
+    if (-not (Test-Path -LiteralPath $file)) { return $null }
+    try {
+        return (ConvertFrom-RecordDate (Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json).lastNotification)
+    } catch {
+        return $null
+    }
+}
+
+# Save-ReminderState: remembers when the last notification was shown. Does
+# nothing without a local folder (test mode without "local=").
+function Save-ReminderState {
+    param([string]$LocalDir, [datetime]$When)
+    if (-not $LocalDir) { return }
+    if (-not (Test-Path -LiteralPath $LocalDir)) { New-Item -ItemType Directory -Path $LocalDir -Force | Out-Null }
+    $text = [pscustomobject]@{ lastNotification = $When.ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) } | ConvertTo-Json
+    [System.IO.File]::WriteAllText((Join-Path $LocalDir 'state.json'), $text, (New-Object System.Text.UTF8Encoding($true)))
+}
+
+# Get-DatedRecords: the records of one kind with their dates parsed, oldest
+# first. Lines whose date can't be read are left out.
+function Get-DatedRecords {
+    param($Records, [string]$Kind)
+    $dated = foreach ($r in @($Records)) {
+        if ($null -eq $r -or $r.kind -ne $Kind) { continue }
+        $date = ConvertFrom-RecordDate $r.date
+        if ($null -eq $date) { continue }
+        [pscustomobject]@{ Date = $date; Source = $r.source; Destination = $r.destination; Result = $r.result }
+    }
+    return @($dated | Sort-Object Date)
+}
+
+# Get-SuggestedDrive: the backup drive whose last successful copy is oldest,
+# among the drives that have one in the records, or $null. Failed and skipped
+# lines don't count, so a drive whose last copy failed stays the oldest.
+function Get-SuggestedDrive {
+    param($Records)
+    $last = @{}
+    foreach ($r in (Get-DatedRecords $Records 'mirror')) {
+        if ($r.Result -eq 'ok') { $last[[string]$r.Destination] = $r.Date }
+    }
+    if ($last.Count -eq 0) { return $null }
+    return @($last.GetEnumerator() | Sort-Object Value, Name)[0].Name
+}
+
+# Get-ReminderItem: the state of one kind of backup: the last time it was done
+# (result "ok") and skipped, when the next one is due, and whether it's due now.
+# The interval counts from the last done-or-skipped record. A backup with no
+# record is due. AgeDays is always the age of the last backup actually done.
+function Get-ReminderItem {
+    param($Records, [string]$Kind, [double]$IntervalDays, [datetime]$Now)
+    $list = @(Get-DatedRecords $Records $Kind)
+    $done = @($list | Where-Object { $_.Result -eq 'ok' })
+    $skipped = @($list | Where-Object { $_.Result -eq 'skipped' })
+    $lastDone = if ($done.Count -gt 0) { $done[$done.Count - 1].Date } else { $null }
+    $lastSkipped = if ($skipped.Count -gt 0) { $skipped[$skipped.Count - 1].Date } else { $null }
+    $base = $lastDone
+    if ($null -ne $lastSkipped -and ($null -eq $base -or $lastSkipped -gt $base)) { $base = $lastSkipped }
+    $nextDue = if ($null -ne $base) { $base.AddDays($IntervalDays) } else { $null }
+    $age = if ($null -ne $lastDone) { [int][math]::Max(0, [math]::Floor(($Now - $lastDone).TotalDays)) } else { $null }
+    return [pscustomobject][ordered]@{
+        Kind = $Kind; LastDone = $lastDone; LastSkipped = $lastSkipped; NextDue = $nextDue
+        Due = ($null -eq $nextDue -or $Now -ge $nextDue); AgeDays = $age; SuggestedDrive = $null
+    }
+}
+
+# Get-ReminderStatus: .System and .Mirror, each as from Get-ReminderItem. Only
+# .Mirror has a suggested drive.
+function Get-ReminderStatus {
+    param($Records, $Settings, [datetime]$Now = (Get-Date))
+    $system = Get-ReminderItem $Records 'system' $Settings.SystemDays $Now
+    $mirror = Get-ReminderItem $Records 'mirror' $Settings.MirrorDays $Now
+    $mirror.SuggestedDrive = Get-SuggestedDrive $Records
+    return [pscustomobject]@{ System = $system; Mirror = $mirror }
+}
+
+# Test-ReminderGapPassed: is it long enough since the last notification?
+function Test-ReminderGapPassed {
+    param($LastNotification, [double]$GapHours, [datetime]$Now = (Get-Date))
+    if ($null -eq $LastNotification) { return $true }
+    return (($Now - $LastNotification).TotalHours -ge $GapHours)
+}
+
+# Format-ReminderAge: "today", "1 day ago" or "N days ago".
+function Format-ReminderAge {
+    param([int]$Days)
+    if ($Days -le 0) { return 'today' }
+    if ($Days -eq 1) { return '1 day ago' }
+    return "$Days days ago"
+}
+
+# Format-ReminderLine: one line of the notification, with the real age of the
+# last backup actually done, and for a mirror the drive to use.
+function Format-ReminderLine {
+    param($Item)
+    $name = if ($Item.Kind -eq 'system') { 'System backup' } else { 'Mirror' }
+    if ($null -ne $Item.LastDone) { $when = "last done $(Format-ReminderAge $Item.AgeDays)" }
+    elseif ($null -ne $Item.LastSkipped) { $when = 'never done' }
+    else { $when = 'never recorded' }
+    $line = "${name}: $when."
+    if ($Item.Kind -eq 'mirror' -and $Item.SuggestedDrive) { $line += " Next drive: $($Item.SuggestedDrive)." }
+    return $line
+}
+
+# Get-ReminderDecision: what -Check should do, in the design's order: exit if
+# the reminders are off, if the screen is locked, if the last notification is
+# too recent, or if nothing is due; otherwise notify. .Action is disabled,
+# locked, gap, nothing or notify.
+function Get-ReminderDecision {
+    param($Settings, $Status, [bool]$Locked, $LastNotification, [datetime]$Now = (Get-Date))
+    $result = [pscustomobject]@{ Action = 'nothing'; Title = 'Backups due'; Lines = @() }
+    if (-not $Settings.Enabled) { $result.Action = 'disabled'; return $result }
+    if ($Locked) { $result.Action = 'locked'; return $result }
+    if (-not (Test-ReminderGapPassed $LastNotification $Settings.GapHours $Now)) { $result.Action = 'gap'; return $result }
+    $lines = @()
+    foreach ($item in @($Status.System, $Status.Mirror)) {
+        if ($item.Due) { $lines += (Format-ReminderLine $item) }
+    }
+    if ($lines.Count -gt 0) { $result.Action = 'notify'; $result.Lines = $lines }
+    return $result
+}
+
+# Get-ReminderToastXml: the notification's XML, with its text escaped.
+function Get-ReminderToastXml {
+    param([string]$Title, [string[]]$Lines)
+    $texts = @($Title) + @($Lines) | ForEach-Object { '<text>' + [System.Security.SecurityElement]::Escape($_) + '</text>' }
+    return '<toast><visual><binding template="ToastGeneric">' + ($texts -join '') + '</binding></visual></toast>'
+}
+
+# Add-SkipRecord: a "skipped" line in local\runs.csv. A system line uses the
+# computer's name and the last partition recorded. A mirror line uses the last
+# source recorded and the suggested drive. Either can be empty with no records.
+function Add-SkipRecord {
+    param([string]$LocalDir, [string]$Kind, $Records, [string]$ComputerName = $env:COMPUTERNAME, $Date = $null)
+    $list = @(Get-DatedRecords $Records $Kind)
+    $newest = if ($list.Count -gt 0) { $list[$list.Count - 1] } else { $null }
+    if ($Kind -eq 'system') {
+        $source = $ComputerName
+        $destination = if ($null -ne $newest) { [string]$newest.Destination } else { '' }
+    } else {
+        $source = if ($null -ne $newest) { [string]$newest.Source } else { '' }
+        $destination = [string](Get-SuggestedDrive $Records)
+    }
+    return (Add-RunRecord -LocalDir $LocalDir -Kind $Kind -Source $source -Destination $destination -Result 'skipped' -Verification 'not performed' -Health 'not checked' -Date $Date)
+}
+
+# Test-ReminderLocked: is the screen locked? Windows' lock screen process,
+# LogonUI.exe, runs while it is. In test mode: a locked.txt in the local folder.
+function Test-ReminderLocked {
+    param([string]$LocalDir)
+    if (Test-RoboBakTestMode) {
+        return [bool]($LocalDir -and (Test-Path -LiteralPath (Join-Path $LocalDir 'locked.txt')))
+    }
+    return ($null -ne (Get-Process -Name 'LogonUI' -ErrorAction SilentlyContinue))
+}
+
+# Get-ReminderCommand: how the shortcut (the window) and the task (-Check) start
+# robobak-reminders.ps1: through conhost.exe --headless, so no console window
+# appears, whatever the default terminal is.
+function Get-ReminderCommand {
+    param([string]$ScriptPath, [switch]$Check)
+    $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $argument = "--headless `"$powershell`" -NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
+    if ($Check) { $argument += ' -Check' }
+    return [pscustomobject]@{ Execute = (Join-Path $env:SystemRoot 'System32\conhost.exe'); Argument = $argument }
+}
+
+# New-ReminderTriggers: the task's triggers, as chosen in the settings. The
+# sign-in and unlock triggers wait a minute, so LogonUI.exe has closed by the
+# time the check looks for it. These objects exist only in memory.
+function New-ReminderTriggers {
+    param($Settings, [string]$User)
+    $triggers = @()
+    if ($Settings.TriggerLogon) {
+        $logon = New-ScheduledTaskTrigger -AtLogOn -User $User
+        $logon.Delay = 'PT1M'
+        $triggers += $logon
+    }
+    if ($Settings.TriggerUnlock) {
+        $class = Get-CimClass -Namespace 'Root/Microsoft/Windows/TaskScheduler' -ClassName 'MSFT_TaskSessionStateChangeTrigger'
+        $triggers += New-CimInstance -CimClass $class -ClientOnly -Property @{ StateChange = [uint32]8; UserId = $User; Delay = 'PT1M'; Enabled = $true }
+    }
+    if ($Settings.TriggerDaily) {
+        $triggers += New-ScheduledTaskTrigger -Daily -At ([datetime]::ParseExact($Settings.DailyTime, 'HH:mm', [System.Globalization.CultureInfo]::InvariantCulture))
+    }
+    return $triggers
+}
+
+# New-ReminderTaskDefinition: the parts of the scheduled task, only in memory:
+# it runs -Check as the user, one at a time, and is disabled when the reminders
+# are off.
+function New-ReminderTaskDefinition {
+    param($Settings, [string]$ScriptPath, [string]$User)
+    $command = Get-ReminderCommand -ScriptPath $ScriptPath -Check
+    $taskSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+    $taskSettings.Enabled = [bool]$Settings.Enabled
+    return [pscustomobject]@{
+        Action    = New-ScheduledTaskAction -Execute $command.Execute -Argument $command.Argument
+        Triggers  = @(New-ReminderTriggers $Settings $User)
+        Settings  = $taskSettings
+        Principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Limited
+    }
+}
+
+# Test-AccessDeniedError: did a scheduled-task cmdlet fail for lack of rights?
+# Judged by the error's category and code, not its text, which is translated.
+function Test-AccessDeniedError {
+    param($ErrorRecord)
+    if ($ErrorRecord.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::PermissionDenied) { return $true }
+    return ([string]$ErrorRecord.FullyQualifiedErrorId -match '0x80070005')
+}
+
+# Register-ReminderTask: creates or rewrites the scheduled task. Returns .Ok,
+# .AccessDenied and .Message. Whether Windows allows this without administrator
+# rights can only be known on the computer, so a refusal says what to do.
+# Test mode never touches Task Scheduler.
+function Register-ReminderTask {
+    param($Settings, [string]$ScriptPath)
+    if (Test-RoboBakTestMode) {
+        return [pscustomobject]@{ Ok = $false; AccessDenied = $false; Message = 'TEST MODE: the scheduled task was not touched.' }
+    }
+    try {
+        $definition = New-ReminderTaskDefinition -Settings $Settings -ScriptPath $ScriptPath -User "$env:USERDOMAIN\$env:USERNAME"
+        $register = @{ TaskName = $script:ReminderTaskName; Action = $definition.Action; Settings = $definition.Settings; Principal = $definition.Principal; Force = $true; ErrorAction = 'Stop' }
+        if ($definition.Triggers.Count -gt 0) { $register['Trigger'] = $definition.Triggers }
+        Register-ScheduledTask @register | Out-Null
+        return [pscustomobject]@{ Ok = $true; AccessDenied = $false; Message = 'The scheduled task was updated.' }
+    } catch {
+        if (Test-AccessDeniedError $_) {
+            return [pscustomobject]@{ Ok = $false; AccessDenied = $true; Message = "Windows refused to change the scheduled task (access denied). Open PowerShell as administrator, go to the RoboBak folder and run .\install-reminders.ps1." }
+        }
+        return [pscustomobject]@{ Ok = $false; AccessDenied = $false; Message = "Could not change the scheduled task: $($_.Exception.Message)" }
+    }
+}
+
+# The Start menu shortcut needs an application ID for notifications to show
+# "RoboBak" as their sender, and only the Windows Shell can write one. This small
+# class does that through the shortcut's property store.
+$script:ShortcutAppIdSource = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+namespace RoboBakInterop {
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    public struct PropertyKey { public Guid FormatId; public uint PropertyId; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PropVariant { public ushort Type; public ushort Reserved1; public ushort Reserved2; public ushort Reserved3; public IntPtr Value; public IntPtr Value2; }
+    [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPropertyStore {
+        void GetCount(out uint count);
+        void GetAt(uint index, out PropertyKey key);
+        void GetValue(ref PropertyKey key, out PropVariant value);
+        void SetValue(ref PropertyKey key, ref PropVariant value);
+        void Commit();
+    }
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+    class ShellLink { }
+    public static class ShortcutAppId {
+        public static void Set(string path, string appId) {
+            object link = new ShellLink();
+            PropVariant value = new PropVariant();
+            value.Type = 31; // VT_LPWSTR
+            value.Value = Marshal.StringToCoTaskMemUni(appId);
+            try {
+                IPersistFile file = (IPersistFile)link;
+                file.Load(path, 2); // STGM_READWRITE
+                PropertyKey key = new PropertyKey();
+                key.FormatId = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"); // PKEY_AppUserModel_ID
+                key.PropertyId = 5;
+                IPropertyStore store = (IPropertyStore)link;
+                store.SetValue(ref key, ref value);
+                store.Commit();
+                file.Save(path, true);
+            } finally {
+                Marshal.FreeCoTaskMem(value.Value);
+                Marshal.ReleaseComObject(link);
+            }
+        }
+    }
+}
+'@
+
+# New-ReminderShortcut: the "RoboBak" Start menu shortcut. It opens the window
+# and carries the application ID. Never used in test mode.
+function New-ReminderShortcut {
+    param([string]$ShortcutPath, [string]$ScriptPath)
+    if (Test-RoboBakTestMode) { throw 'TEST MODE: no shortcut is created.' }
+    $command = Get-ReminderCommand -ScriptPath $ScriptPath
+    $shell = New-Object -ComObject WScript.Shell
+    $link = $shell.CreateShortcut($ShortcutPath)
+    $link.TargetPath = $command.Execute
+    $link.Arguments = $command.Argument
+    $link.WorkingDirectory = Split-Path -Parent $ScriptPath
+    $link.IconLocation = (Join-Path $env:SystemRoot 'System32\shell32.dll') + ',7'
+    $link.Description = 'RoboBak: backup status and reminder settings'
+    $link.Save()
+    if (-not ('RoboBakInterop.ShortcutAppId' -as [type])) { Add-Type -TypeDefinition $script:ShortcutAppIdSource }
+    [RoboBakInterop.ShortcutAppId]::Set($ShortcutPath, $script:ReminderAppId)
+}
