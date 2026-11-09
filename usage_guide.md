@@ -11,6 +11,7 @@
 - Both source and destination drives must be connected and accessible
 - `robobak.ps1`, `robobak-lib.ps1` and `robobak-health.ps1` must be in the same folder. The library holds functions shared with the tests; if it's missing, the script stops with an error before doing anything
 - Optional, for [disk health](#disk-health): smartmontools or CrystalDiskInfo, and administrator rights when the run ends
+- Optional, for the [reminders](#reminders): `robobak-reminders.ps1` and `install-reminders.ps1`, in the same folder
 
 ### Execution policy
 
@@ -169,8 +170,9 @@ All log files are organized into dedicated folders instead of the drive root.
 
 | File | Description |
 |------|-------------|
-| `runs.csv` | One line per backup: every mirror run that ran the copy (step 14) and every system backup recorded with `--system-done`. Lines are only ever appended, never rewritten. Created, with its header, the first time a line is written |
-| `settings.json` | Optional, written by you: the red warning's thresholds (see [Settings](#settings)). RoboBak never creates it |
+| `runs.csv` | One line per backup: every mirror run that ran the copy (step 14), every system backup recorded with `--system-done`, and every Skip in the [reminders window](#reminders). Lines are only ever appended, never rewritten. Created, with its header, the first time a line is written |
+| `settings.json` | Optional: the warnings' thresholds, written by you, and the reminder settings, written by the window (see [Settings](#settings)). `robobak.ps1` never creates it |
+| `state.json` | When the last [reminder](#reminders) notification was shown. Written by the check |
 
 `runs.csv` columns:
 
@@ -180,7 +182,7 @@ All log files are organized into dedicated folders instead of the drive root.
 | `kind` | `mirror` or `system` |
 | `source` | The source drive's label. For a system backup, the computer's name |
 | `destination` | The destination drive's label, or the system image partition's label |
-| `result` | `ok` or `failed` (Robocopy exit code 8 or more) |
+| `result` | `ok`, `failed` (Robocopy exit code 8 or more) or `skipped` (the Skip button in the reminders window; the verification is `not performed` and the health `not checked`) |
 | `verification` | `passed`, `differences` or `not performed`. Always `not performed` for a system backup |
 | `health` | `ok`, `yellow`, `red`, `not approved`, or `not checked` (no tool installed, or no disk could be read). With two disks, the worst of those that were read. See [Disk health](#disk-health) |
 
@@ -259,15 +261,15 @@ Verification duration: 00:02:10
 
 ## The local folder
 
-`local\` sits in the folder that holds the script and keeps what only this computer knows: the backup records (`runs.csv`) and, if you created it, `settings.json`. RoboBak creates the folder the first time it records a run.
+`local\` sits in the folder that holds the script and keeps what only this computer knows: the backup records (`runs.csv`), the settings (`settings.json`, if there are any) and when the last reminder was shown (`state.json`). RoboBak creates the folder the first time it records a run.
 
 - **Ignored by Git** (`.gitignore`), so it's never committed or published. Beware: `git clean -x` deletes ignored files, including `local\`.
 - **Back it up before reinstalling Windows or moving to another computer:** copy the whole `local\` folder somewhere safe (an external drive, for example). After installing RoboBak again, put it back next to `robobak.ps1`. Without it, everything still works, but the records start from zero.
-- **A copy is enough:** the files are plain text, and nothing else on the computer refers to them.
+- **A copy is enough:** the files are plain text. If you use the [reminders](#reminders), run `install-reminders.ps1` again afterwards, because the shortcut and the scheduled task aren't in this folder.
 
 ## Settings
 
-Settings are optional and live in `local\settings.json`, in the folder that holds the script. The file has one section per program; RoboBak reads only its own, `robobak`:
+Settings are optional and live in `local\settings.json`, in the folder that holds the script. The file has one section per program. `robobak.ps1` reads only its own, `robobak`:
 
 ```json
 {
@@ -289,8 +291,34 @@ Settings are optional and live in `local\settings.json`, in the folder that hold
 | `healthWarnYears` | `5` | Disk health: yellow warning for a disk older than this many years. Only for disks whose year you gave |
 | `healthWarnTempC` | `50` | Disk health: yellow warning above this temperature at the end of the run, in °C |
 
-- **RoboBak only reads this file and never creates it.** A missing file, section or key means the default.
-- **Invalid values** (negative numbers, text, broken JSON) are reported in yellow before the confirmation screen, and the defaults are used instead.
+The [reminders window](#reminders) keeps its own section, `reminders`, and rewrites only that one when you press Save:
+
+```json
+{
+  "reminders": {
+    "enabled": true,
+    "systemDays": 14,
+    "mirrorDays": 14,
+    "gapHours": 24,
+    "triggerLogon": true,
+    "triggerUnlock": true,
+    "triggerDaily": true,
+    "dailyTime": "12:00"
+  }
+}
+```
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `enabled` | `true` | Reminders on or off. Off also disables the scheduled task |
+| `systemDays` | `14` | Days between system backups before one is due |
+| `mirrorDays` | `14` | Days between mirrors before one is due |
+| `gapHours` | `24` | At most one notification every this many hours. `0` means no limit |
+| `triggerLogon`, `triggerUnlock`, `triggerDaily` | `true` | When the check runs: at sign-in, when the screen is unlocked, and every day |
+| `dailyTime` | `12:00` | The time of the daily check, as `HH:mm` |
+
+- **`robobak.ps1` only reads this file and never creates it.** A missing file, section or key means the default.
+- **Invalid values** (negative numbers, text, broken JSON) are reported in yellow before the confirmation screen, or by the window, and the defaults are used instead. The window won't save over a file with broken JSON.
 - **`local\` is ignored by Git** (`.gitignore`), so it's never committed. Beware: `git clean -x` deletes ignored files, including `local\` (see [The local folder](#the-local-folder)).
 
 ## Disk health
@@ -369,6 +397,74 @@ The thresholds are in [Settings](#settings).
 **Limits:**
 - **NVMe disks** have no 05, C5, C6 or C7, so those rules don't apply to them.
 - **Through CrystalDiskInfo,** the SMART status is `unknown` unless its report says `Good` or `Bad`, because the word is translated into CrystalDiskInfo's language. The attribute rules still apply.
+
+## Reminders
+
+Optional. A small window shows when each backup was last done and what's due, and a scheduled task shows a Windows notification when one is due. **Nothing here ever runs a backup.** The reminders only read `local\runs.csv`, so a backup that wasn't recorded counts as not done: run `robobak.ps1` for mirrors, and `--system-done` after each system backup.
+
+### Install
+
+In PowerShell, in the script's folder:
+
+```powershell
+.\install-reminders.ps1
+```
+
+If Windows refuses to create the scheduled task (access denied), the script says so: open PowerShell as administrator, go to the same folder and run it again. The window's Save button rewrites the task too, and shows the same message if it's refused.
+
+It creates:
+
+| Where | What | Removing it |
+|-------|------|-------------|
+| Start menu | A `RoboBak` shortcut (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\RoboBak.lnk`). It opens the window, and carries the application ID that makes notifications show "RoboBak" as their sender | `-Uninstall` |
+| Task Scheduler | A task named `RoboBak reminders`, which runs the check as your user, without administrator rights, one at a time, through `conhost.exe --headless` so that no window appears | `-Uninstall` |
+
+Using them adds to `local\`:
+
+| File | What | Removing it |
+|------|------|-------------|
+| `runs.csv` | A `skipped` line for each Skip | Part of the records |
+| `settings.json` | The `reminders` section, when you press Save | The defaults come back |
+| `state.json` | When the last notification was shown | The next one can come at once |
+
+The shortcut and the task hold the script's full path, so **if you move or rename the folder, run `install-reminders.ps1` again**.
+
+### Uninstall
+
+```powershell
+.\install-reminders.ps1 -Uninstall
+```
+
+It removes the shortcut and the scheduled task, then asks before deleting `local\`, which holds your records: type `Y` to delete it, anything else to keep it.
+
+### The window
+
+Open **RoboBak** from the Start menu, or run `.\robobak-reminders.ps1`.
+
+- **For the system backup and the mirror:** when it was last done, when it was last skipped, and when the next one is due. Before any record exists, it says `never recorded`, and the backup counts as due.
+- **Suggested drive:** the backup drive whose last successful copy is oldest. It only knows drives that have a successful mirror in `runs.csv`; failed and skipped lines don't count.
+- **Skip:** enabled only for a backup that's due. It writes a `skipped` line, and the next reminder comes one interval later. The age shown in notifications remains that of the last backup actually done.
+- **Settings:** reminders on or off, the two intervals, the gap between notifications, and when the check runs. **Save** writes the `reminders` section of `local\settings.json` and rewrites the scheduled task.
+
+### The check
+
+The scheduled task runs `robobak-reminders.ps1 -Check` at sign-in, when the screen is unlocked (each a minute later, so the lock screen has closed) and every day at the time you set. Each time it goes through these steps, in order, and stops at the first that applies:
+
+1. **Reminders off:** nothing.
+2. **Screen locked** (Windows' lock screen process, `LogonUI.exe`, is running): nothing.
+3. **A notification less than the gap ago** (24 hours by default): nothing.
+4. **Nothing due:** nothing.
+5. **Otherwise,** one notification listing what's due, and it saves the time in `local\state.json`:
+
+```
+Backups due
+System backup: last done 20 days ago.
+Mirror: last done 20 days ago. Next drive: BACKUP_2.
+```
+
+A backup is due when its interval has passed since its last done-or-skipped record. A failed mirror doesn't count as done.
+
+To run the check by hand and see what it decides, run `.\robobak-reminders.ps1 -Check` in PowerShell: it prints the reason, or `notified`.
 
 ## Time estimates
 
@@ -473,9 +569,10 @@ Each check prints `PASS` or `FAIL`, and the script ends with `Passed: N  Failed:
 - **`robobak.ps1` end to end,** with the answers to its prompts piped in: cancelling leaves everything byte-identical, `L` then `Y` mirrors and keeps the dry run's files, a second run verifies, 501 deleted files trigger the red warning, and a wrong letter or label is refused before any robocopy runs.
 - **Behaviour kept from before the dry run existed:** for the default mode, `--show-progress` and `--verbose`, and for the verification, robocopy's echo of its own options (source, destination, excluded folders and flags) must match exactly what the original commands produce on an identical pair of folders. They also cover the verify question when no flag is given, the refusals (`--show-progress` with `--verbose`, the same letter twice), the help, the warning for a source without a label, and a failed copy (a locked file): `BACKUP FAILED`, the error in the summary, the failed entry in `backup_times.txt`, and no history update.
 - **Disk health:** smartctl's and CrystalDiskInfo's output parsed from recorded examples, the history file, every red and yellow rule, the first reading, a saved disk that isn't connected, cancelling the admin prompt, `--health` and `--no-health`, no tool installed, and a mirror keeping the history.
+- **Reminders:** every rule for what's due, the suggested drive, skip lines, the notification gap and text, the settings saved without touching the other sections, the task's triggers built in memory, `-Check` end to end, and the window built without being shown. `install-reminders.ps1` is only parsed: running it would create a real shortcut and task.
 - **Backup records:** one `runs.csv` line per run that ran the copy (verified, not verified, verify question answered N, failed), none for cancelled or refused runs, the header written once, the byte order mark, and labels with quotes, commas and accents surviving `Import-Csv`. `--system-done`: `Y` records one `system` line, `N` records nothing, an unmapped letter, a missing letter and a `BACKUP_` label are refused, and nothing is copied or changed on any folder. The tests check at the end that the repo's own `local\runs.csv` was never touched.
 
-**What they can't prove:** they use NTFS folders on the computer's own disk, not exFAT or VeraCrypt drives over USB, so the label fallback for VeraCrypt volumes, real timings and drive-specific behaviour still need a run on real drives. Disk health uses recorded data instead of the tools and runs the helper without administrator rights, so the real admin prompt and the real tools' output also need a run on real drives.
+**What they can't prove:** they use NTFS folders on the computer's own disk, not exFAT or VeraCrypt drives over USB, so the label fallback for VeraCrypt volumes, real timings and drive-specific behaviour still need a run on real drives. Disk health uses recorded data instead of the tools and runs the helper without administrator rights, so the real admin prompt and the real tools' output also need a run on real drives. For the reminders, the shortcut, the scheduled task, the notification and how the window looks can only be checked on the computer.
 
 ### Test mode
 
@@ -490,6 +587,7 @@ F=C:\Temp\rb\src|DATA;E=C:\Temp\rb\dst|BACKUP_TEST;local=C:\Temp\rb\local
 - **`health=<folder>`** holds recorded disk health data instead of the tools and Windows: `pd<N>.json` and `pd<N>.sat.json` (what `smartctl -a -j` prints for disk N, without and with `-d sat`), `DiskInfo.txt` (CrystalDiskInfo's report), `disk_of_<LETTER>.txt` (the disk number of a plain partition) and `cancel_elevation.txt` (simulates cancelling the admin prompt). The helper is started the same way, without elevation. Without this entry, test mode skips disk health.
 - **Folders can't contain spaces,** because robocopy misreads a quoted path that ends in a backslash.
 - **While it's on,** the script shows a `TEST MODE` banner, and `L` prints the list's path instead of opening Notepad.
+- **For the reminders,** `-Check` prints what it would notify instead of showing a notification, a file named `locked.txt` in the `local=` folder stands for a locked screen, `robobak-reminders.ps1 -TestBuild` builds the window without showing it, nothing is registered with Task Scheduler, and `install-reminders.ps1` refuses to run.
 
 Don't set `ROBOBAK_TEST` for real backups. The test script sets it only for the copies of PowerShell it starts.
 

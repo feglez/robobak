@@ -15,6 +15,7 @@ A PowerShell script that creates exact mirror backups of one drive onto another 
 - **Backup records** — one line per mirror run in `local\runs.csv`, next to the script, with its result and verification
 - **System backup records** — `--system-done` records a system backup made with another program, so the records cover both kinds of backup
 - **Disk health** — optional, at the end of a run: reads the SMART data of the disks used (with smartmontools or CrystalDiskInfo), keeps a history on each drive and shows red or yellow warnings
+- **Reminders** — optional: a small window shows when each backup was last done and what's due, and a scheduled task shows a Windows notification when one is due. Nothing runs a backup automatically
 - **Detailed logging** — full Robocopy report, summary with errors, and verification report on the destination
 
 ## Requirements
@@ -23,6 +24,7 @@ A PowerShell script that creates exact mirror backups of one drive onto another 
 - PowerShell 5.1+ (included with Windows 10/11)
 - `robobak.ps1`, `robobak-lib.ps1` and `robobak-health.ps1` in the same folder
 - Optional, for disk health: [smartmontools](https://github.com/smartmontools/smartmontools/releases) or CrystalDiskInfo, and administrator rights when the run ends
+- Optional, for the reminders: `robobak-reminders.ps1` and `install-reminders.ps1`, in the same folder
 
 ## Quick start
 
@@ -93,7 +95,25 @@ Records in `local\runs.csv` that a system backup (made with another program, suc
 | Dest `current_backup_logs\` | `dry_run_list.txt` | What the dry run listed: files to delete, then files to copy |
 | Dest `current_backup_logs\` | `dry_run_log.txt` | Full Robocopy report of the dry run |
 | Dest or image partition `robobak_health\` | `disk_health.txt`, `disk_link.json` | That drive's disk health history, and which disk holds it. Kept between runs |
-| Script folder `local\` | `runs.csv` | One line per mirror run and per recorded system backup |
+| Script folder `local\` | `runs.csv` | One line per mirror run, recorded system backup and skipped backup |
+| Script folder `local\` | `settings.json` | Optional: warning thresholds, and the window's reminder settings |
+| Script folder `local\` | `state.json` | When the last reminder notification was shown |
+
+## Reminders
+
+Optional. Install them from PowerShell, in the script's folder:
+
+```powershell
+.\install-reminders.ps1
+```
+
+This creates a **Start menu shortcut** called `RoboBak`, which opens the status and settings window, and a **scheduled task** called `RoboBak reminders`, which shows a Windows notification when a backup is due. To remove both (it asks before deleting `local\`):
+
+```powershell
+.\install-reminders.ps1 -Uninstall
+```
+
+See [Reminders](usage_guide.md#reminders) in the usage guide.
 
 ## Disk health
 
@@ -101,7 +121,7 @@ At the end of a run, RoboBak asks `Log disk health? This needs admin rights.` If
 
 ## The `local\` folder
 
-`local\` sits next to the script and holds what only this computer knows: `runs.csv` (the backup records) and, optionally, `settings.json` (the warnings' thresholds, which RoboBak only reads and never creates). It's ignored by Git, so it's never committed, but `git clean -x` would delete it. To keep the records when you reinstall Windows or move to another computer, copy the whole folder and put it back next to the script. See [The local folder](usage_guide.md#the-local-folder) in the usage guide.
+`local\` sits next to the script and holds what only this computer knows: `runs.csv` (the backup records), optionally `settings.json` (the warnings' thresholds, which `robobak.ps1` only reads, and the reminder settings, which the window writes) and `state.json` (when the last reminder was shown). It's ignored by Git, so it's never committed, but `git clean -x` would delete it. To keep the records when you reinstall Windows or move to another computer, copy the whole folder and put it back next to the script. See [The local folder](usage_guide.md#the-local-folder) in the usage guide.
 
 ## Tests
 
