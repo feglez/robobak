@@ -1183,6 +1183,333 @@ C7 200 200 _0 0000000000FF Errores CRC
     Assert-Equal 'not checked' (Get-LastRun $i6Local).health "test mode without health=: runs.csv has 'not checked'"
 
     # ------------------------------------------------------------------
+    Write-Section "Reminders: the scripts and the interop code"
+
+    # install-reminders.ps1 is only parsed: running it creates a shortcut and a
+    # task, so it's for the user to run.
+    foreach ($name in @('robobak-reminders.ps1', 'install-reminders.ps1')) {
+        $tokens = $null; $parseErrors = $null
+        $null = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot $name), [ref]$tokens, [ref]$parseErrors)
+        Assert-Equal 0 @($parseErrors).Count "$name has no syntax errors"
+        Assert-True ((Get-Content -LiteralPath (Join-Path $RepoRoot $name) -Raw) -cnotmatch '[^\x00-\x7F]') "$name is ASCII-only"
+    }
+    Add-Type -TypeDefinition $script:ShortcutAppIdSource
+    Assert-True ([bool]('RoboBakInterop.ShortcutAppId' -as [type])) "the shortcut's application ID code compiles"
+
+    # ------------------------------------------------------------------
+    Write-Section "Reminders: settings and state"
+
+    function Write-RemFile {
+        param([string]$Dir, [string]$Name, [string]$Text)
+        New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $Dir $Name), $Text, (New-Object System.Text.UTF8Encoding($false)))
+    }
+
+    $remDir = Join-Path $TestRoot 'rem_settings'
+    $def = Read-ReminderSettings $remDir
+    Assert-Equal 'True|14|14|24|True|True|True|12:00' "$($def.Enabled)|$($def.SystemDays)|$($def.MirrorDays)|$($def.GapHours)|$($def.TriggerLogon)|$($def.TriggerUnlock)|$($def.TriggerDaily)|$($def.DailyTime)" "no settings file: the defaults"
+    Assert-True ($null -eq $def.Warning) "no settings file: no warning"
+    Assert-Equal 14 (Read-ReminderSettings '').SystemDays "no local folder: the defaults"
+
+    Write-RemFile $remDir 'settings.json' '{"reminders":{"enabled":false,"systemDays":7,"mirrorDays":21,"gapHours":0,"triggerLogon":false,"triggerUnlock":false,"triggerDaily":false,"dailyTime":"08:30"}}'
+    $set = Read-ReminderSettings $remDir
+    Assert-Equal 'False|7|21|0|False|False|False|08:30' "$($set.Enabled)|$($set.SystemDays)|$($set.MirrorDays)|$($set.GapHours)|$($set.TriggerLogon)|$($set.TriggerUnlock)|$($set.TriggerDaily)|$($set.DailyTime)" "every setting is read, and a gap of 0 is valid"
+    Assert-True ($null -eq $set.Warning) "valid settings: no warning"
+
+    Write-RemFile $remDir 'settings.json' '{"robobak":{"deleteWarnFiles":9}}'
+    $set = Read-ReminderSettings $remDir
+    Assert-True ($set.SystemDays -eq 14 -and $null -eq $set.Warning) "no reminders section: the defaults, no warning"
+
+    Write-RemFile $remDir 'settings.json' '{"reminders":{"enabled":"yes","systemDays":0,"mirrorDays":"x","gapHours":-1,"triggerDaily":1,"dailyTime":"25:00"}}'
+    $set = Read-ReminderSettings $remDir
+    Assert-Equal 'True|14|14|24|True|12:00' "$($set.Enabled)|$($set.SystemDays)|$($set.MirrorDays)|$($set.GapHours)|$($set.TriggerDaily)|$($set.DailyTime)" "invalid values fall back to their defaults"
+    foreach ($key in @('enabled', 'systemDays', 'mirrorDays', 'gapHours', 'triggerDaily', 'dailyTime')) { Assert-Contains $set.Warning $key "the warning names $key" }
+
+    Write-RemFile $remDir 'settings.json' '{ not json'
+    $set = Read-ReminderSettings $remDir
+    Assert-True ($set.SystemDays -eq 14 -and $set.Warning -match 'invalid JSON') "broken JSON: the defaults and a warning"
+
+    $saveDir = Join-Path $TestRoot 'rem_save'
+    $toSave = [pscustomobject]@{ Enabled = $false; SystemDays = 10; MirrorDays = 20; GapHours = 12; TriggerLogon = $false; TriggerUnlock = $true; TriggerDaily = $false; DailyTime = '09:15' }
+    Save-ReminderSettings $saveDir $toSave
+    $back = Read-ReminderSettings $saveDir
+    Assert-Equal 'False|10|20|12|False|True|False|09:15' "$($back.Enabled)|$($back.SystemDays)|$($back.MirrorDays)|$($back.GapHours)|$($back.TriggerLogon)|$($back.TriggerUnlock)|$($back.TriggerDaily)|$($back.DailyTime)" "saving creates the folder and the file, and reads back"
+
+    Write-RemFile $saveDir 'settings.json' '{"robobak":{"deleteWarnFiles":7,"healthWarnHours":123},"other":{"x":1},"reminders":{"systemDays":99}}'
+    Save-ReminderSettings $saveDir $toSave
+    $json = Get-Content -LiteralPath (Join-Path $saveDir 'settings.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-Equal '7|123|1|10' "$($json.robobak.deleteWarnFiles)|$($json.robobak.healthWarnHours)|$($json.other.x)|$($json.reminders.systemDays)" "saving keeps the other sections and replaces only its own"
+    Assert-Equal 7 (Read-RoboBakSettings $saveDir).DeleteWarnFiles "robobak.ps1 still reads its own section after a save"
+
+    Write-RemFile $saveDir 'settings.json' '{ not json'
+    $threw = $false
+    try { Save-ReminderSettings $saveDir $toSave } catch { $threw = $true }
+    Assert-True $threw "saving over broken JSON is refused"
+    Assert-Equal '{ not json' (Get-Content -LiteralPath (Join-Path $saveDir 'settings.json') -Raw -Encoding UTF8) "and the broken file is left as it was"
+    $threw = $false
+    try { Save-ReminderSettings '' $toSave } catch { $threw = $true }
+    Assert-True $threw "saving without a local folder is refused"
+
+    $stateDir = Join-Path $TestRoot 'rem_state'
+    Assert-True ($null -eq (Read-ReminderState $stateDir)) "no state file: no last notification"
+    $when = [datetime]'2026-06-15 09:30:05'
+    Save-ReminderState $stateDir $when
+    Assert-Equal $when (Read-ReminderState $stateDir) "the last notification's time reads back"
+    Write-RemFile $stateDir 'state.json' 'garbage'
+    Assert-True ($null -eq (Read-ReminderState $stateDir)) "a broken state file counts as no last notification"
+    Save-ReminderState '' $when
+    Assert-True ($null -eq (Read-ReminderState '')) "no local folder: the state is neither saved nor read"
+
+    # ------------------------------------------------------------------
+    Write-Section "Reminders: what's due"
+
+    function New-Rec {
+        param([string]$Date, [string]$Kind, [string]$Dest = 'BACKUP_1', [string]$Result = 'ok', [string]$Source = 'DATA')
+        return [pscustomobject]@{ date = $Date; kind = $Kind; source = $Source; destination = $Dest; result = $Result; verification = 'passed'; health = 'ok' }
+    }
+    $now = [datetime]'2026-06-15 12:00:00'
+    $rs = Read-ReminderSettings ''
+
+    $st = Get-ReminderStatus -Records @() -Settings $rs -Now $now
+    Assert-True ($st.System.Due -and $st.Mirror.Due) "no records: both are due"
+    Assert-True ($null -eq $st.System.LastDone -and $null -eq $st.System.NextDue -and $null -eq $st.System.AgeDays) "no records: no dates and no age"
+
+    $st = Get-ReminderStatus -Records @(New-Rec '2026-06-10 12:00:00' 'system') -Settings $rs -Now $now
+    Assert-True (-not $st.System.Due) "done 5 days ago: not due"
+    Assert-Equal 5 $st.System.AgeDays "the age of the last backup done"
+    Assert-Equal ([datetime]'2026-06-24 12:00:00') $st.System.NextDue "next due is the interval after it"
+    Assert-True ($st.Mirror.Due) "the two kinds are independent"
+
+    $st = Get-ReminderStatus -Records @(New-Rec '2026-06-01 12:00:00' 'system') -Settings $rs -Now $now
+    Assert-True ($st.System.Due) "exactly the interval: due"
+    $st = Get-ReminderStatus -Records @(New-Rec '2026-06-01 12:00:01' 'system') -Settings $rs -Now $now
+    Assert-True (-not $st.System.Due) "one second short of the interval: not due"
+
+    $custom = [pscustomobject]@{ SystemDays = 3; MirrorDays = 30 }
+    $st = Get-ReminderStatus -Records @((New-Rec '2026-06-10 12:00:00' 'system'), (New-Rec '2026-06-01 12:00:00' 'mirror')) -Settings $custom -Now $now
+    Assert-True ($st.System.Due -and -not $st.Mirror.Due) "each kind uses its own interval"
+
+    $st = Get-ReminderStatus -Records @((New-Rec '2026-05-01 12:00:00' 'system'), (New-Rec '2026-06-10 12:00:00' 'system' 'SYSIMG_1' 'skipped')) -Settings $rs -Now $now
+    Assert-True (-not $st.System.Due) "a skip postpones the next reminder by one interval"
+    Assert-Equal 45 $st.System.AgeDays "the age is still that of the last backup actually done"
+    Assert-Equal ([datetime]'2026-06-10 12:00:00') $st.System.LastSkipped "the last skip is reported"
+
+    $st = Get-ReminderStatus -Records @((New-Rec '2026-06-10 12:00:00' 'system'), (New-Rec '2026-05-01 12:00:00' 'system' 'SYSIMG_1' 'skipped')) -Settings $rs -Now $now
+    Assert-Equal ([datetime]'2026-06-24 12:00:00') $st.System.NextDue "an older skip doesn't move the date back"
+
+    $st = Get-ReminderStatus -Records @((New-Rec '2026-05-01 12:00:00' 'mirror'), (New-Rec '2026-06-14 12:00:00' 'mirror' 'BACKUP_1' 'failed')) -Settings $rs -Now $now
+    Assert-True ($st.Mirror.Due) "a failed mirror isn't a done one: still due"
+    Assert-Equal ([datetime]'2026-05-01 12:00:00') $st.Mirror.LastDone "a failed mirror doesn't count as the last done"
+
+    $st = Get-ReminderStatus -Records @((New-Rec 'not a date' 'system'), (New-Rec '2026-06-10 12:00:00' 'system')) -Settings $rs -Now $now
+    Assert-Equal ([datetime]'2026-06-10 12:00:00') $st.System.LastDone "a line with a bad date is ignored"
+
+    Assert-True ($null -eq (Get-SuggestedDrive @())) "no records: no suggested drive"
+    Assert-True ($null -eq (Get-SuggestedDrive @(New-Rec '2026-06-10 12:00:00' 'system' 'SYSIMG_1'))) "system lines don't suggest a drive"
+    $recs = @((New-Rec '2026-06-01 12:00:00' 'mirror' 'BACKUP_1'), (New-Rec '2026-06-10 12:00:00' 'mirror' 'BACKUP_2'))
+    Assert-Equal 'BACKUP_1' (Get-SuggestedDrive $recs) "the drive whose last copy is oldest"
+    Assert-Equal 'BACKUP_2' (Get-SuggestedDrive ($recs + @(New-Rec '2026-06-12 12:00:00' 'mirror' 'BACKUP_1'))) "a new copy to it moves the suggestion to the other drive"
+    Assert-Equal 'BACKUP_1' (Get-SuggestedDrive ($recs + @(New-Rec '2026-06-12 12:00:00' 'mirror' 'BACKUP_1' 'failed'))) "a failed copy doesn't count: the drive stays the oldest"
+    Assert-Equal 'BACKUP_1' (Get-SuggestedDrive ($recs + @(New-Rec '2026-06-12 12:00:00' 'mirror' 'BACKUP_1' 'skipped'))) "a skipped copy doesn't count either"
+    Assert-True ($null -eq (Get-SuggestedDrive @(New-Rec '2026-06-12 12:00:00' 'mirror' 'BACKUP_9' 'failed'))) "a drive with no successful copy isn't suggested"
+    Assert-Equal 'BACKUP_A' (Get-SuggestedDrive @((New-Rec '2026-06-01 12:00:00' 'mirror' 'BACKUP_B'), (New-Rec '2026-06-01 12:00:00' 'mirror' 'BACKUP_A'))) "a tie goes to the first name, every time"
+    $st = Get-ReminderStatus -Records $recs -Settings $rs -Now $now
+    Assert-Equal 'BACKUP_1' $st.Mirror.SuggestedDrive "the mirror's status names the suggested drive"
+    Assert-True ($null -eq $st.System.SuggestedDrive) "the system backup's status names none"
+
+    # ------------------------------------------------------------------
+    Write-Section "Reminders: the decision and the notification"
+
+    Assert-True (Test-ReminderGapPassed $null 24 $now) "no previous notification: the gap has passed"
+    Assert-True (Test-ReminderGapPassed $now.AddHours(-24) 24 $now) "exactly the gap: passed"
+    Assert-True (-not (Test-ReminderGapPassed $now.AddHours(-23) 24 $now)) "less than the gap: not passed"
+    Assert-True (Test-ReminderGapPassed $now 0 $now) "a gap of 0 never blocks"
+
+    Assert-Equal 'today' (Format-ReminderAge 0) "age 0 reads 'today'"
+    Assert-Equal '1 day ago' (Format-ReminderAge 1) "age 1 is singular"
+    Assert-Equal '20 days ago' (Format-ReminderAge 20) "age 20 is plural"
+
+    $both = Get-ReminderStatus -Records @((New-Rec '2026-05-26 12:00:00' 'system' 'SYSIMG_1'), (New-Rec '2026-05-20 12:00:00' 'mirror' 'BACKUP_2')) -Settings $rs -Now $now
+    $d = Get-ReminderDecision -Settings $rs -Status $both -Locked $false -LastNotification $null -Now $now
+    Assert-Equal 'notify' $d.Action "both due: notify"
+    Assert-Equal 'System backup: last done 20 days ago.' $d.Lines[0] "the system line has the real age"
+    Assert-Equal 'Mirror: last done 26 days ago. Next drive: BACKUP_2.' $d.Lines[1] "the mirror line also names the drive"
+    Assert-Equal 2 @($d.Lines).Count "one line per backup due"
+
+    $onlySystem = Get-ReminderStatus -Records @((New-Rec '2026-05-26 12:00:00' 'system'), (New-Rec '2026-06-14 12:00:00' 'mirror')) -Settings $rs -Now $now
+    $d = Get-ReminderDecision -Settings $rs -Status $onlySystem -Locked $false -LastNotification $null -Now $now
+    Assert-True (@($d.Lines).Count -eq 1 -and $d.Lines[0] -like 'System backup:*') "only what's due is listed"
+
+    $none = Get-ReminderStatus -Records @((New-Rec '2026-06-14 12:00:00' 'system'), (New-Rec '2026-06-14 12:00:00' 'mirror')) -Settings $rs -Now $now
+    Assert-Equal 'nothing' (Get-ReminderDecision -Settings $rs -Status $none -Locked $false -LastNotification $null -Now $now).Action "nothing due: no notification"
+
+    Assert-Equal 'locked' (Get-ReminderDecision -Settings $rs -Status $both -Locked $true -LastNotification $null -Now $now).Action "the screen is locked: no notification"
+    Assert-Equal 'gap' (Get-ReminderDecision -Settings $rs -Status $both -Locked $false -LastNotification $now.AddHours(-1) -Now $now).Action "too soon after the last one: no notification"
+    Assert-Equal 'notify' (Get-ReminderDecision -Settings $rs -Status $both -Locked $false -LastNotification $now.AddHours(-25) -Now $now).Action "the gap has passed: notify"
+    $off = [pscustomobject]@{ Enabled = $false; GapHours = 24 }
+    Assert-Equal 'disabled' (Get-ReminderDecision -Settings $off -Status $both -Locked $false -LastNotification $null -Now $now).Action "reminders off: no notification"
+    Assert-Equal 'locked' (Get-ReminderDecision -Settings $rs -Status $both -Locked $true -LastNotification $now.AddHours(-1) -Now $now).Action "the lock is checked before the gap"
+
+    $never = Get-ReminderStatus -Records @() -Settings $rs -Now $now
+    $d = Get-ReminderDecision -Settings $rs -Status $never -Locked $false -LastNotification $null -Now $now
+    Assert-Equal 'System backup: never recorded.|Mirror: never recorded.' ($d.Lines -join '|') "no records: 'never recorded', and no drive"
+    $skipOnly = Get-ReminderStatus -Records @(New-Rec '2026-05-20 12:00:00' 'system' 'SYSIMG_1' 'skipped') -Settings $rs -Now $now
+    Assert-Equal 'System backup: never done.' (Format-ReminderLine $skipOnly.System) "only skips: 'never done'"
+
+    $xmlText = Get-ReminderToastXml -Title 'Backups & more' -Lines @('Mirror: <x>', 'System')
+    $parsed = [xml]$xmlText
+    $texts = @($parsed.toast.visual.binding.text)
+    Assert-Equal 'Backups & more|Mirror: <x>|System' ($texts -join '|') "the notification's XML is well-formed and its text is escaped"
+
+    # ------------------------------------------------------------------
+    Write-Section "Reminders: skip lines"
+
+    $skipDir = Join-Path $TestRoot 'rem_skip'
+    $skipRecs = @((New-Rec '2026-06-01 12:00:00' 'system' 'SYSIMG_1' 'ok' 'LAPTOP'), (New-Rec '2026-06-01 12:00:00' 'mirror' 'BACKUP_1' 'ok' 'MY_DATA'), (New-Rec '2026-06-10 12:00:00' 'mirror' 'BACKUP_2' 'ok' 'MY_DATA'))
+    $null = Add-SkipRecord -LocalDir $skipDir -Kind 'system' -Records $skipRecs -ComputerName 'THEPC' -Date $now
+    $null = Add-SkipRecord -LocalDir $skipDir -Kind 'mirror' -Records $skipRecs -ComputerName 'THEPC' -Date $now
+    $written = @(Read-RunRecords $skipDir)
+    Assert-Equal 2 $written.Count "one line per skip"
+    Assert-Equal '2026-06-15 12:00:00|system|THEPC|SYSIMG_1|skipped|not performed|not checked' (@($written[0].date, $written[0].kind, $written[0].source, $written[0].destination, $written[0].result, $written[0].verification, $written[0].health) -join '|') "a system skip: the computer and the last partition"
+    Assert-Equal 'mirror|MY_DATA|BACKUP_1|skipped|not checked' (@($written[1].kind, $written[1].source, $written[1].destination, $written[1].result, $written[1].health) -join '|') "a mirror skip: the last source and the suggested drive"
+    $emptyDir = Join-Path $TestRoot 'rem_skip_empty'
+    $null = Add-SkipRecord -LocalDir $emptyDir -Kind 'mirror' -Records @() -ComputerName 'THEPC' -Date $now
+    $written = @(Read-RunRecords $emptyDir)
+    Assert-True ($written.Count -eq 1 -and $written[0].source -eq '' -and $written[0].destination -eq '') "a mirror skip with no records has no labels"
+    $st = Get-ReminderStatus -Records $written -Settings $rs -Now $now
+    Assert-True (-not $st.Mirror.Due -and $null -eq $st.Mirror.SuggestedDrive) "that skip postpones it and suggests no drive"
+
+    # ------------------------------------------------------------------
+    Write-Section "Reminders: the scheduled task, in memory only"
+
+    $taskUser = "$env:USERDOMAIN\$env:USERNAME"
+    $cmd = Get-ReminderCommand -ScriptPath 'C:\a b\robobak-reminders.ps1'
+    Assert-True ($cmd.Execute -like '*\conhost.exe') "it starts through conhost.exe"
+    Assert-True ($cmd.Argument.StartsWith('--headless ')) "with --headless"
+    Assert-Contains $cmd.Argument '-File "C:\a b\robobak-reminders.ps1"' "a path with spaces is quoted"
+    Assert-True (-not $cmd.Argument.EndsWith('-Check')) "the shortcut opens the window"
+    Assert-True ((Get-ReminderCommand -ScriptPath 'C:\x.ps1' -Check).Argument.EndsWith(' -Check')) "the task runs -Check"
+
+    $triggers = @(New-ReminderTriggers (Read-ReminderSettings '') $taskUser)
+    Assert-Equal 3 $triggers.Count "the three triggers by default"
+    Assert-Equal 'MSFT_TaskLogonTrigger|MSFT_TaskSessionStateChangeTrigger|MSFT_TaskDailyTrigger' (($triggers | ForEach-Object { $_.CimClass.CimClassName }) -join '|') "sign-in, unlock and daily"
+    Assert-Equal 'PT1M|PT1M' "$($triggers[0].Delay)|$($triggers[1].Delay)" "sign-in and unlock wait a minute"
+    Assert-Equal 8 ([int]$triggers[1].StateChange) "the session trigger is the unlock"
+    Assert-Equal "$taskUser|$taskUser" "$($triggers[0].UserId)|$($triggers[1].UserId)" "sign-in and unlock are for this user only"
+    Assert-Equal '12:00' (([datetime]$triggers[2].StartBoundary).ToString('HH:mm')) "the daily time is used"
+    $some = [pscustomobject]@{ TriggerLogon = $false; TriggerUnlock = $true; TriggerDaily = $false; DailyTime = '12:00' }
+    $t = @(New-ReminderTriggers $some $taskUser)
+    Assert-True ($t.Count -eq 1 -and $t[0].CimClass.CimClassName -eq 'MSFT_TaskSessionStateChangeTrigger') "only the triggers switched on"
+    $allOff = [pscustomobject]@{ TriggerLogon = $false; TriggerUnlock = $false; TriggerDaily = $false; DailyTime = '12:00' }
+    Assert-Equal 0 @(New-ReminderTriggers $allOff $taskUser).Count "no triggers if all are off"
+
+    $def = New-ReminderTaskDefinition -Settings (Read-ReminderSettings '') -ScriptPath 'C:\a b\robobak-reminders.ps1' -User $taskUser
+    Assert-Contains $def.Action.Arguments '-Check' "the task's action runs -Check"
+    Assert-Equal 'IgnoreNew' ([string]$def.Settings.MultipleInstances) "one at a time"
+    Assert-True ($def.Settings.Enabled) "enabled when the reminders are on"
+    Assert-Equal 'Interactive|Limited' "$($def.Principal.LogonType)|$($def.Principal.RunLevel)" "runs as the user, without admin rights"
+    Assert-Equal $taskUser $def.Principal.UserId "for this user"
+    $offSettings = Read-ReminderSettings ''
+    $offSettings.Enabled = $false
+    Assert-True (-not (New-ReminderTaskDefinition -Settings $offSettings -ScriptPath 'C:\x.ps1' -User $taskUser).Settings.Enabled) "disabled when the reminders are off"
+
+    $denied = New-Object System.Management.Automation.ErrorRecord((New-Object System.Exception 'x'), 'HRESULT 0x80070005,Register-ScheduledTask', [System.Management.Automation.ErrorCategory]::NotSpecified, $null)
+    $byCategory = New-Object System.Management.Automation.ErrorRecord((New-Object System.Exception 'x'), 'y', [System.Management.Automation.ErrorCategory]::PermissionDenied, $null)
+    $other = New-Object System.Management.Automation.ErrorRecord((New-Object System.Exception 'x'), 'HRESULT 0x80070002,Register-ScheduledTask', [System.Management.Automation.ErrorCategory]::ObjectNotFound, $null)
+    Assert-True (Test-AccessDeniedError $denied) "access denied is recognized by its code"
+    Assert-True (Test-AccessDeniedError $byCategory) "and by its category"
+    Assert-True (-not (Test-AccessDeniedError $other)) "other errors aren't taken for it"
+
+    $env:ROBOBAK_TEST = "local=$saveDir"
+    $res = Register-ReminderTask -Settings (Read-ReminderSettings '') -ScriptPath 'C:\x.ps1'
+    $threw = $false
+    try { New-ReminderShortcut -ShortcutPath (Join-Path $TestRoot 'x.lnk') -ScriptPath 'C:\x.ps1' } catch { $threw = $true }
+    $env:ROBOBAK_TEST = $null
+    Assert-True ((-not $res.Ok) -and $res.Message -like 'TEST MODE*') "test mode never registers the task"
+    Assert-True ($threw -and -not (Test-Path -LiteralPath (Join-Path $TestRoot 'x.lnk'))) "test mode never creates the shortcut"
+
+    # ------------------------------------------------------------------
+    Write-Section "End to end (j): -Check and the window"
+
+    $RemindersScript = Join-Path $RepoRoot 'robobak-reminders.ps1'
+    function Invoke-ReminderTest {
+        param([string]$TestEnv, [string[]]$Arguments)
+        $env:ROBOBAK_TEST = $TestEnv
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $RemindersScript @Arguments 2>&1
+            $script:ReminderExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previous
+            $env:ROBOBAK_TEST = $null
+        }
+        return (($output | ForEach-Object { "$_" }) -join "`n")
+    }
+
+    $jDir = Join-Path $TestRoot 'rem_check'
+    $jEnv = "local=$jDir"
+    $null = Add-RunRecord -LocalDir $jDir -Kind 'system' -Source 'PC' -Destination 'SYSIMG_1' -Result 'ok' -Verification 'not performed' -Date (Get-Date).AddDays(-20)
+    $null = Add-RunRecord -LocalDir $jDir -Kind 'mirror' -Source 'DATA' -Destination 'BACKUP_1' -Result 'ok' -Verification 'passed' -Date (Get-Date).AddDays(-1)
+
+    $out = Invoke-ReminderTest $jEnv @('-Check')
+    Assert-Contains $out "TEST MODE: would notify: Backups due" "-Check says what it would notify, and shows no notification"
+    Assert-Contains $out "System backup: last done 20 days ago." "with the real age"
+    Assert-NotContains $out "Mirror:" "and only what's due"
+    Assert-Equal 0 $script:ReminderExit "-Check exits with 0"
+    Assert-True (Test-Path -LiteralPath (Join-Path $jDir 'state.json')) "the notification's time is saved"
+
+    $out = Invoke-ReminderTest $jEnv @('-Check')
+    Assert-Contains $out "RoboBak check: gap." "a second check right after: nothing, because of the gap"
+    Assert-NotContains $out "would notify" "and no notification"
+
+    Remove-Item -LiteralPath (Join-Path $jDir 'state.json') -Force
+    Write-RemFile $jDir 'locked.txt' 'x'
+    $out = Invoke-ReminderTest $jEnv @('-Check')
+    Assert-Contains $out "RoboBak check: locked." "the lock state comes from the test folder"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $jDir 'state.json'))) "a locked screen saves no notification time"
+    Remove-Item -LiteralPath (Join-Path $jDir 'locked.txt') -Force
+
+    Save-ReminderState $jDir (Get-Date).AddHours(-25)
+    $out = Invoke-ReminderTest $jEnv @('-Check')
+    Assert-Contains $out "would notify" "after the gap, it notifies again"
+
+    Remove-Item -LiteralPath (Join-Path $jDir 'state.json') -Force
+    Save-ReminderSettings $jDir ([pscustomobject]@{ Enabled = $false; SystemDays = 14; MirrorDays = 14; GapHours = 24; TriggerLogon = $true; TriggerUnlock = $true; TriggerDaily = $true; DailyTime = '12:00' })
+    $out = Invoke-ReminderTest $jEnv @('-Check')
+    Assert-Contains $out "RoboBak check: disabled." "reminders off: nothing"
+    Remove-Item -LiteralPath (Join-Path $jDir 'settings.json') -Force
+
+    $j2Dir = Join-Path $TestRoot 'rem_check2'
+    $null = Add-RunRecord -LocalDir $j2Dir -Kind 'system' -Source 'PC' -Destination 'SYSIMG_1' -Result 'ok' -Verification 'not performed' -Date (Get-Date).AddDays(-1)
+    $null = Add-RunRecord -LocalDir $j2Dir -Kind 'mirror' -Source 'DATA' -Destination 'BACKUP_1' -Result 'ok' -Verification 'passed' -Date (Get-Date).AddDays(-1)
+    $out = Invoke-ReminderTest "local=$j2Dir" @('-Check')
+    Assert-Contains $out "RoboBak check: nothing." "nothing due: nothing"
+
+    $out = Invoke-ReminderTest "S=$TestRoot|DATA_T" @('-Check')
+    Assert-Contains $out "System backup: never recorded." "test mode without local=: no records, so everything is due"
+    Assert-Contains $out "Mirror: never recorded." "and the mirror too"
+
+    $j3Dir = Join-Path $TestRoot 'rem_window'
+    $null = Add-RunRecord -LocalDir $j3Dir -Kind 'system' -Source 'PC' -Destination 'SYSIMG_1' -Result 'ok' -Verification 'not performed' -Date (Get-Date).AddDays(-20)
+    $null = Add-RunRecord -LocalDir $j3Dir -Kind 'mirror' -Source 'DATA' -Destination 'BACKUP_1' -Result 'ok' -Verification 'passed' -Date (Get-Date).AddDays(-10)
+    $null = Add-RunRecord -LocalDir $j3Dir -Kind 'mirror' -Source 'DATA' -Destination 'BACKUP_2' -Result 'ok' -Verification 'passed' -Date (Get-Date).AddDays(-3)
+    $out = Invoke-ReminderTest "local=$j3Dir" @('-TestBuild')
+    Assert-Contains $out "PANEL system: done=" "the window builds without being shown"
+    Assert-True ($out -match 'PANEL system: .*\(20 days ago\).*skip=True') "a backup that's due has its Skip button enabled"
+    Assert-True ($out -match 'PANEL mirror: .*drive=BACKUP_1 \| skip=False') "the mirror shows the suggested drive, and isn't due"
+    Assert-Contains $out "SETTINGS: on=True system=14 mirror=14 gap=24 time=12:00" "the settings show their values"
+    Assert-Contains $out "AFTER SKIP: skipped=$((Get-Date).ToString('yyyy-MM-dd'))" "Skip updates the status"
+    Assert-Equal 'skipped' (Read-RunRecords $j3Dir | Select-Object -Last 1).result "Skip writes a skipped line"
+    Assert-Contains $out "AFTER SAVE: Settings saved, but the task was not updated." "Save writes the settings, and test mode leaves Task Scheduler alone"
+    Assert-True (Test-Path -LiteralPath (Join-Path $j3Dir 'settings.json')) "the settings file is written"
+    Assert-Equal 0 $script:ReminderExit "the window's test build ends cleanly"
+
+    $out = Invoke-ReminderTest "local=$(Join-Path $TestRoot 'rem_empty')" @('-TestBuild')
+    Assert-True ($out -match 'PANEL system: done=never recorded \| skipped=never \| next=now') "with no records, the window says 'never recorded'"
+    Assert-True ($out -match 'PANEL mirror: .*drive=none recorded yet') "and no suggested drive"
+
+    # ------------------------------------------------------------------
     Write-Section "The repo's own local\ folder"
 
     $realAfter = if (Test-Path -LiteralPath $RealRunsCsv) { (Get-FileHash -LiteralPath $RealRunsCsv).Hash } else { 'absent' }
