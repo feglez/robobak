@@ -410,7 +410,7 @@ In PowerShell, in the script's folder:
 .\install-reminders.ps1
 ```
 
-If Windows refuses to create the scheduled task (access denied), the script says so: open PowerShell as administrator, go to the same folder and run it again. The window's Save button rewrites the task too, and shows the same message if it's refused.
+It needs no administrator rights. If Windows refuses to create the scheduled task anyway (access denied), the script says so: open PowerShell as administrator, go to the same folder and run it again. The window's Save button rewrites the task too, and shows the same message if it's refused.
 
 It creates:
 
@@ -461,6 +461,8 @@ Backups due
 System backup: last done 20 days ago.
 Mirror: last done 20 days ago. Next drive: BACKUP_2.
 ```
+
+The notification is only a message: clicking it opens nothing. To see the window, open **RoboBak** from the Start menu.
 
 A backup is due from the start of its next due date, which is the date of its last done-or-skipped record plus the interval. A failed mirror doesn't count as done.
 
