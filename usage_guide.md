@@ -118,7 +118,7 @@ Run it right after the system backup program has finished, where `S` is the part
 3. **Logs the partition's disk health** — optional, see [Disk health](#disk-health). `--health` or `--no-health` after the letter answer the question in advance
 4. **Records it** — appends one `system` line to `local\runs.csv` (see [Script folder](#script-folder-local)), with the computer's name as the source and the partition's label as the destination
 
-It **never copies or deletes anything**, runs no Robocopy, and doesn't check the backup itself: checking it is the backup program's job.
+It **never copies or deletes anything**, runs no Robocopy, and doesn't check the backup itself: checking it is the backup program's job. For a full procedure with one such program, see [System backups with Hasleo](#system-backups-with-hasleo).
 
 ## What the script does (step by step)
 
@@ -467,6 +467,176 @@ The notification is only a message: clicking it opens nothing. To see the window
 A backup is due from the start of its next due date, which is the date of its last done-or-skipped record plus the interval. A failed mirror doesn't count as done.
 
 To run the check by hand and see what it decides, run `.\robobak-reminders.ps1 -Check` in PowerShell: it prints the reason, or `notified`.
+
+## System backups with Hasleo
+
+RoboBak mirrors drives. It doesn't make images of the computer's own disk, so a full backup of Windows needs another program. This section is a procedure for doing that with [Hasleo Backup Suite Free](https://www.easyuefi.com/backup-software/backup-suite-free.html), recording each backup with [`--system-done`](#recording-a-system-backup---system-done). RoboBak doesn't depend on it, and any imaging program will do.
+
+It was written on Hasleo 6.0.2.0, on a UEFI computer with Windows 11 Pro, Secure Boot on and BitLocker on `C:`. Names in **bold** are Hasleo's own labels, which may change between versions.
+
+> **Not tried: an actual restore.** Everything up to the moment a restore starts has been tried, including booting the rescue stick and opening an image with it. Starting a restore overwrites the disk, so it wasn't done.
+
+### The layout it assumes
+
+| Drive | Example | Holds |
+|-------|---------|-------|
+| Data drive | `DATA`, VeraCrypt, `F:` | Your files, and the source of every mirror |
+| Backup drive A, first partition | `BACKUP_1`, VeraCrypt, `E:` | A mirror of the data drive |
+| Backup drive A, second partition | `SYSIMG_1`, plain NTFS, `S:` | The system images |
+| Backup drive B | `BACKUP_2`, VeraCrypt, `G:` | A mirror of the data drive |
+
+- **The image partition isn't inside VeraCrypt,** because the rescue stick has to read it. Hasleo encrypts the images itself, with its own password.
+- **It has no `BACKUP_` label,** so RoboBak refuses to mirror onto it.
+- **Mirrors rotate between the backup drives.** Each run goes to the drive whose copy is oldest, and the drive with the older copy is your previous version of a file deleted by mistake. The [reminders window](#the-window) names the next drive.
+
+### Install and uninstall
+
+1. Download the installer for "Windows 7 or later" from [Hasleo's download page](https://www.easyuefi.com/backup-software/download.html).
+2. Run it and accept the administrator prompt. It offers no options.
+3. To check it, open it from the Start menu: it should start without asking for a licence or an account. On first launch it asks about a default storage folder for images. Answer **No** and tick **Don't remind me again**, because each task has its own destination.
+
+The Free edition doesn't support Windows Education, Enterprise or Server, has no command line, and can't restore onto different hardware ([comparison table](https://www.easyuefi.com/backup-software/comparison.html)).
+
+It creates:
+
+| Where | What | Removing it |
+|-------|------|-------------|
+| `C:\Program Files\Hasleo\Hasleo Backup Suite\` | The program | Uninstall |
+| Windows services | `Hasleo Backup Suite Service`, which starts with Windows | Uninstall |
+| Windows drivers | Hasleo's own drivers, such as `hasleodk.sys` | Uninstall |
+| The image partition | The task's folder, with the `.DBI` image files | Delete the task in Hasleo and accept **Delete related images** |
+| A USB stick | The rescue environment. Building it erases the stick | Format the stick |
+
+To uninstall it: **Settings > Apps > Installed apps > Hasleo Backup Suite > Uninstall** (not tried).
+
+### The backup task
+
+Create it once, as a **System Backup**, which selects the computer's system partitions (EFI, reserved, `C:` and recovery). The destination is a folder on the image partition, such as `S:\Hasleo`. Give it no schedule, because every backup is started by hand.
+
+In the task's **Backup options**:
+
+| Page | Setting | Value |
+|------|---------|-------|
+| Space | Compression | Low |
+| Space | Splitting | Automatic |
+| Space | **Image retention policy > Edit** | **Full**, **Keep** 3 backups. **Incremental** and **Differential** unticked. **Always retain the first backup** unticked. **Purge the oldest backup version(s) when the destination drive has insufficient space** ticked |
+| Encryption | | AES 256, with a password of at least 16 characters |
+| Filter | | The defaults |
+| Advanced | **Smart backup** | On |
+| Advanced | **Check the integrity of the backup image files on completion** | Incremental image check |
+| Advanced | **Default behavior of the "Backup" button** | Incremental |
+
+- **Ticking Full also ticks "Always retain the first backup".** Untick it, or the very first full is kept forever.
+- **Keeping 3 fulls means 3 chains,** because deleting a full also deletes its incrementals. With a full and 3 incrementals in each chain, that's up to 12 restore points, 4 to 6 months back. Retention was tried on a file backup task; that a system task behaves the same is an inference.
+- **Keep the password off the computer.** Without it, the images can't be read.
+
+### The session, every 2 weeks
+
+1. **Connect** backup drive A, and backup drive B if it's B's turn for the mirror. Mount the VeraCrypt volumes. The image partition appears by itself.
+2. **See whether this session makes a Full.** Open the task's folder on the image partition (for example `S:\Hasleo\System\`). Hasleo's file names carry the type, as in `System_YYYYMMDD_Full_V2_1.DBI`. If three files come after the newest `_Full_` one, make a Full this time. What an incremental's name looks like is an inference until you've seen one.
+3. **If you use WSL, close it,** so that its disk file is copied in a consistent state. In PowerShell:
+   ```powershell
+   wsl --shutdown
+   wsl --list --running
+   ```
+   The second command should say that nothing is running. Leave WSL closed until the backup has finished.
+4. **Run the task in Hasleo,** and wait for it to finish, including its check:
+   - normally with the task's **Backup** button, which makes an incremental;
+   - when it's a Full, with **Actions > Backup > Full**.
+5. **Record it** with `.\robobak.ps1 --system-done S`, and type `Y`. It should end with `SYSTEM BACKUP RECORDED`.
+6. **Start WSL again** if you need it.
+7. **Mirror the data drive** to the backup drive whose copy is oldest, for example `.\robobak.ps1 F E --verify`.
+8. **If step 4 made a Full,** start **Actions > Check image > Complete image check** and let it finish.
+
+**Why the Full is chosen by hand:** a backup started by hand always makes the type set for the **Backup** button. **Perform a full backup after a specified number of backups** only exists in recurring schedules.
+
+**Why the complete check goes with the Full:** the automatic check only reads the files that session created, so this is what re-reads the images of earlier sessions. Skip it after the very first Full, or a one-off Full, when there's nothing older to read.
+
+### The rescue stick
+
+It starts Hasleo without Windows, so you can restore an image or reach your disks when Windows won't start.
+
+**To build it,** with only the stick connected, because the builder erases its target:
+
+1. In Hasleo, **Tools > Emergency Disk**.
+2. Keep **Automatic driver injection** on. Tick **Enable support for 'Windows UEFI CA 2023'** if your firmware has that certificate (see [Secure Boot and BitLocker](#secure-boot-and-bitlocker)). When it asks how to create WinPE, choose **From WinRE**, then **Next**.
+3. Choose **USB**, and check that the drive shown is the stick. If it already holds an older image, click **Re-create WinPE image ISO** first.
+4. **Proceed**, **Yes** at the format warning, and **Close** when it finishes.
+
+**To test it,** with backup drive A connected:
+
+1. From a full shutdown, hold your computer's boot menu key while pressing the power button, and choose the stick's `UEFI:` entry. If the firmware has a password, it asks for it first.
+2. Hasleo should open by itself.
+3. **Tools > File Explorer** should list the internal disk. If BitLocker locks it, **Tools > Unlock BitLocker Drive** opens it with the recovery key. If the disk isn't listed at all, rebuild the stick with **Add Driver** and your storage controller's `.inf` (not needed on the computer this was written on).
+4. **Restore > Browse image to restore** should open a `.DBI` file on the image partition and accept its password. Drive letters may differ here, and a VeraCrypt partition looks unformatted, so leave it alone. **Stop when the version screen appears.**
+
+Test it again after a firmware update or any Secure Boot change, and rebuild it if Hasleo asks you to after an update.
+
+### Restoring
+
+**Not tried.** Only steps 1 and 2, and reaching the screen of step 3, have been done. The rest comes from Hasleo's tutorial and its labels.
+
+1. Connect backup drive A and start from the rescue stick. Drive letters may differ, so look for the partition labeled `SYSIMG_1`.
+2. **Restore > Browse image to restore**, choose the `.DBI` file in the task's folder, and type the password.
+3. Choose the version you want and **System mode**, then **Next**.
+4. Choose the target disk and **Restore to original location**. **The next Next starts the restore and overwrites that disk.**
+5. When it finishes, remove the stick and restart.
+
+Hasleo Free brings `C:` back unencrypted, so turn BitLocker on again afterwards, and keep its new recovery key off the computer.
+
+### Copying files out of an image
+
+1. In Hasleo, select the task, then **Actions > Mount/Unmount image**. Type the password and choose the version.
+2. Give the `C:` volume a drive letter, and leave **Mount as writable** off.
+3. Copy what you need from that letter.
+4. Unmount it from the same place.
+
+For files your user can't read, copy them from an administrator PowerShell with `robocopy <folder> <destination> <file> /B`. Exit code 1 means the file was copied. Hasleo's own **Allow access to restricted files/folders** option wasn't tried, and a message inside the program says the Free edition doesn't support it.
+
+If Windows won't start, **Tools > File Explorer** on the rescue stick shows your disks. Copying out of an image from there wasn't tried.
+
+### Restoring WSL from an image
+
+For emergencies, such as a dead computer. WSL lives in one file, `ext4.vhdx`, which the image holds. This was tried once, on the same computer, next to the real distro. On a different computer it's not tried.
+
+1. Install Hasleo and WSL, connect the backup drive, and mount the newest image on a letter such as `M:`, as in the previous section.
+2. Find the file under `M:\Users\<user>\AppData\Local\wsl\{GUID}\`. On the original computer, `BasePath` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss\{GUID}` gives its folder.
+3. In PowerShell **as administrator**, copy it out. Exit code 1 means the file was copied:
+   ```powershell
+   robocopy "M:\Users\<user>\AppData\Local\wsl\{GUID}" "C:\WSL\Ubuntu" ext4.vhdx /B /R:1 /W:5
+   ```
+4. In the same window, make yourself the file's owner. Without this, WSL fails with `E_ACCESSDENIED`:
+   ```powershell
+   icacls "C:\WSL\Ubuntu\ext4.vhdx" /setowner "$env:USERNAME"
+   icacls "C:\WSL\Ubuntu\ext4.vhdx" /grant "${env:USERNAME}:F"
+   ```
+5. Unmount the image. In a **normal** PowerShell, register the copy:
+   ```powershell
+   wsl --import-in-place Ubuntu "C:\WSL\Ubuntu\ext4.vhdx"
+   ```
+6. To check it, run `wsl -d Ubuntu`, then `whoami` and `ls ~`. You should be your usual user if `/etc/wsl.conf` sets one, and your folders should be there.
+
+**To try this next to your real distro,** give the copy another name, such as `RestoreTest`, and remove it afterwards with `wsl --unregister RestoreTest`. **Unregistering deletes that distro's disk file, so double-check the name.** Stopping a second systemd distro can leave the first one failing with `Exec format error` on every `.exe`. Running `sudo systemctl restart systemd-binfmt` in the real distro fixes it.
+
+### Secure Boot and BitLocker
+
+System backups work with both on. This is what they change:
+
+- **The images hold plain data.** Hasleo reads `C:` through Windows, so an image of a BitLocker disk isn't BitLocker-encrypted: on the computer this was written on, a full came out the same size before and after encrypting. Hasleo's password is what protects the images.
+- **The rescue stick has to pass Secure Boot.** If it's refused, you can turn Secure Boot off in the firmware to start it, but with BitLocker on that will make Windows ask for the recovery key afterwards.
+- **A locked disk can be opened from the stick** with **Tools > Unlock BitLocker Drive** and the recovery key. It works in the Free edition.
+- **Keep the recovery key off the computer,** and off the plain image partition. Paper or an encrypted volume are fine.
+- **Turn Secure Boot on before BitLocker,** so that BitLocker binds to PCR 7 and 11, which are less sensitive to firmware changes ([Microsoft](https://learn.microsoft.com/en-us/troubleshoot/windows-server/setup-upgrade-and-drivers/pcr7-configuration-binding-not-possible)).
+- **Suspend BitLocker before a firmware update or any Secure Boot change,** or Windows will ask for the recovery key at the next start. It resumes by itself after the restarts you set. Not tried. In PowerShell as administrator:
+  ```powershell
+  manage-bde -protectors -disable C: -RebootCount 2
+  ```
+- **Don't restore the firmware's factory Secure Boot keys unless they include the 2023 certificates.** Once Windows has moved to the 2023 boot manager, Secure Boot would block it.
+- **To read BitLocker's state without printing the recovery key,** run `manage-bde -status C:` and `manage-bde -protectors -get C: -Type TPM` as administrator. **Without `-Type TPM`, the second command prints the key.**
+- **To see whether the firmware has the 2023 certificate,** run this in PowerShell as administrator. `True` means it does:
+  ```powershell
+  [System.Text.Encoding]::ASCII.GetString((Get-SecureBootUEFI db).bytes) -match 'Windows UEFI CA 2023'
+  ```
 
 ## Time estimates
 

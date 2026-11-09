@@ -16,6 +16,7 @@ A PowerShell script that creates exact mirror backups of one drive onto another 
 - **System backup records** — `--system-done` records a system backup made with another program, so the records cover both kinds of backup
 - **Disk health** — optional, at the end of a run: reads the SMART data of the disks used (with smartmontools or CrystalDiskInfo), keeps a history on each drive and shows red or yellow warnings
 - **Reminders** — optional: a small window shows when each backup was last done and what's due, and a scheduled task shows a Windows notification when one is due. Nothing runs a backup automatically
+- **System backups guide** — a procedure for imaging the computer with Hasleo Backup Suite Free, alongside the mirrors
 - **Detailed logging** — full Robocopy report, summary with errors, and verification report on the destination
 
 ## Requirements
@@ -118,6 +119,10 @@ See [Reminders](usage_guide.md#reminders) in the usage guide.
 ## Disk health
 
 At the end of a run, RoboBak asks `Log disk health? This needs admin rights.` If you accept, it reads the disks used through Windows' admin prompt, compares them with each drive's history, and shows any warning. Without smartmontools or CrystalDiskInfo it says so in one line, asks nothing and writes nothing on the drives. See [Disk health](usage_guide.md#disk-health) in the usage guide, including how to install and uninstall both tools.
+
+## System backups
+
+RoboBak doesn't make images of the computer's own disk. The usage guide has a procedure for doing that with Hasleo Backup Suite Free and recording each backup with `--system-done`: the two-week session, the rescue stick, restoring, copying files out, restoring WSL from an image, and how Secure Boot and BitLocker affect them. An actual restore hasn't been tried. See [System backups with Hasleo](usage_guide.md#system-backups-with-hasleo).
 
 ## The `local\` folder
 
