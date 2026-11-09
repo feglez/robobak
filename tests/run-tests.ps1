@@ -1287,8 +1287,10 @@ C7 200 200 _0 0000000000FF Errores CRC
 
     $st = Get-ReminderStatus -Records @(New-Rec '2026-06-01 12:00:00' 'system') -Settings $rs -Now $now
     Assert-True ($st.System.Due) "exactly the interval: due"
-    $st = Get-ReminderStatus -Records @(New-Rec '2026-06-01 12:00:01' 'system') -Settings $rs -Now $now
-    Assert-True (-not $st.System.Due) "one second short of the interval: not due"
+    $st = Get-ReminderStatus -Records @(New-Rec '2026-06-01 21:39:39' 'system') -Settings $rs -Now $now
+    Assert-True ($st.System.Due) "due from the start of the due date, even before the hour of the record"
+    $st = Get-ReminderStatus -Records @(New-Rec '2026-06-02 00:00:00' 'system') -Settings $rs -Now ([datetime]'2026-06-15 23:59:59')
+    Assert-True (-not $st.System.Due) "the last second of the day before the due date: not due"
 
     $custom = [pscustomobject]@{ SystemDays = 3; MirrorDays = 30 }
     $st = Get-ReminderStatus -Records @((New-Rec '2026-06-10 12:00:00' 'system'), (New-Rec '2026-06-01 12:00:00' 'mirror')) -Settings $custom -Now $now

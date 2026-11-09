@@ -462,7 +462,7 @@ System backup: last done 20 days ago.
 Mirror: last done 20 days ago. Next drive: BACKUP_2.
 ```
 
-A backup is due when its interval has passed since its last done-or-skipped record. A failed mirror doesn't count as done.
+A backup is due from the start of its next due date, which is the date of its last done-or-skipped record plus the interval. A failed mirror doesn't count as done.
 
 To run the check by hand and see what it decides, run `.\robobak-reminders.ps1 -Check` in PowerShell: it prints the reason, or `notified`.
 
