@@ -550,7 +550,7 @@ In the task's **Backup options**:
 
 **Why the Full is chosen by hand:** a backup started by hand always makes the type set for the **Backup** button. **Perform a full backup after a specified number of backups** only exists in recurring schedules.
 
-**Why the complete check goes with the Full:** the automatic check only reads the files that session created, so this is what re-reads the images of earlier sessions. Skip it after the very first Full, or a one-off Full, when there's nothing older to read.
+**When to skip the complete check:** after the very first Full of a task, or a one-off Full, because the automatic check has just read all of it.
 
 ### The rescue stick
 
