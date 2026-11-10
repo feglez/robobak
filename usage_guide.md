@@ -530,6 +530,7 @@ In the task's **Backup options**:
 - **Ticking Full also ticks "Always retain the first backup".** Untick it, or the very first full is kept forever.
 - **Keeping 3 fulls means 3 chains,** because deleting a full also deletes its incrementals. With a full and 3 incrementals in each chain, that's up to 12 restore points, 4 to 6 months back. Retention was tried on a file backup task; that a system task behaves the same is an inference.
 - **Keep the password off the computer.** Without it, the images can't be read.
+- **More than one computer on the same image partition:** give each computer's task its own name. Hasleo keeps a task's images in a folder named after it (`S:\Hasleo\System\` for a task called `System`), so each computer's chains stay apart, and so does step 2 of the session below.
 
 ### The session, every 2 weeks
 
@@ -571,7 +572,7 @@ It starts Hasleo without Windows, so you can restore an image or reach your disk
 3. **Tools > File Explorer** should list the internal disk. If BitLocker locks it, **Tools > Unlock BitLocker Drive** opens it with the recovery key. If the disk isn't listed at all, rebuild the stick with **Add Driver** and your storage controller's `.inf` (not needed on the computer this was written on).
 4. **Restore > Browse image to restore** should open a `.DBI` file on the image partition and accept its password. Drive letters may differ here, and a VeraCrypt partition looks unformatted, so leave it alone. **Stop when the version screen appears.**
 
-Test it again after a firmware update or any Secure Boot change, and rebuild it if Hasleo asks you to after an update.
+Test it again after a firmware update or any Secure Boot change, and rebuild it if Hasleo asks you to after an update. With more than one computer, build each one's stick on that computer, so it carries that computer's drivers.
 
 ### Restoring
 
@@ -632,7 +633,7 @@ System backups work with both on. This is what they change:
   ```powershell
   manage-bde -protectors -disable C: -RebootCount 2
   ```
-- **Don't restore the firmware's factory Secure Boot keys unless they include the 2023 certificates.** Once Windows has moved to the 2023 boot manager, Secure Boot would block it.
+- **Don't restore the firmware's factory Secure Boot keys unless they include the 2023 certificates.** Once Windows has moved to the 2023 boot manager, Secure Boot would block it. A firmware update that resets the keys to such defaults would do the same, so after one, check that the certificate is still there (below).
 - **To read BitLocker's state without printing the recovery key,** run `manage-bde -status C:` and `manage-bde -protectors -get C: -Type TPM` as administrator. **Without `-Type TPM`, the second command prints the key.**
 - **To see whether the firmware has the 2023 certificate,** run this in PowerShell as administrator. `True` means it does:
   ```powershell
