@@ -266,7 +266,7 @@ Verification duration: 00:02:10
 - **Ignored by Git** (`.gitignore`), so it's never committed or published. Beware: `git clean -x` deletes ignored files, including `local\`.
 - **Back it up before reinstalling Windows or moving to another computer:** copy the whole `local\` folder somewhere safe (an external drive, for example). After installing RoboBak again, put it back next to `robobak.ps1`. Without it, everything still works, but the records start from zero.
 - **A copy is enough:** the files are plain text. If you use the [reminders](#reminders), run `install-reminders.ps1` again afterwards, because the shortcut and the scheduled task aren't in this folder.
-- **More than one computer:** each one keeps its own `local\`, so its window and reminders only know the backups recorded on it. On a computer that only makes system backups, set **Mirror every (days)** to `0` in the [window](#the-window), or it keeps reminding you of a mirror that never comes.
+- **More than one computer:** each one keeps its own `local\`, so its window and reminders only know the backups recorded on it. On a computer that only makes system backups, set **Mirror every (days, 0 = off)** to `0` in the [window](#the-window), or it keeps reminding you of a mirror that never comes.
 
 ## Settings
 
@@ -530,7 +530,7 @@ In the task's **Backup options**:
 - **Ticking Full also ticks "Always retain the first backup".** Untick it, or the very first full is kept forever.
 - **Keeping 3 fulls means 3 chains,** because deleting a full also deletes its incrementals. With a full and 3 incrementals in each chain, that's up to 12 restore points, 4 to 6 months back. Retention was tried on a file backup task; that a system task behaves the same is an inference.
 - **Keep the password off the computer.** Without it, the images can't be read.
-- **More than one computer on the same image partition:** give each computer's task its own name. Hasleo keeps a task's images in a folder named after it (`S:\Hasleo\System\` for a task called `System`), so each computer's chains stay apart, and so does step 2 of the session below.
+- **More than one computer on the same image partition:** give each computer's task its own name. Hasleo put a task called `System` in `S:\Hasleo\System\`, so another name should get its own folder, keeping each computer's chains apart, and step 2 of the session below too. That's an inference: it hasn't been tried with a second task.
 
 ### The session, every 2 weeks
 
@@ -572,7 +572,7 @@ It starts Hasleo without Windows, so you can restore an image or reach your disk
 3. **Tools > File Explorer** should list the internal disk. If BitLocker locks it, **Tools > Unlock BitLocker Drive** opens it with the recovery key. If the disk isn't listed at all, rebuild the stick with **Add Driver** and your storage controller's `.inf` (not needed on the computer this was written on).
 4. **Restore > Browse image to restore** should open a `.DBI` file on the image partition and accept its password. Drive letters may differ here, and a VeraCrypt partition looks unformatted, so leave it alone. **Stop when the version screen appears.**
 
-Test it again after a firmware update or any Secure Boot change, and rebuild it if Hasleo asks you to after an update. With more than one computer, build each one's stick on that computer, so it carries that computer's drivers.
+Test it again after a firmware update or any Secure Boot change, and rebuild it if Hasleo asks you to after an update. With more than one computer, build each one's stick on that computer, so that it gets that computer's drivers through **Automatic driver injection**. That's an inference: a stick hasn't been tried on a second computer.
 
 ### Restoring
 
