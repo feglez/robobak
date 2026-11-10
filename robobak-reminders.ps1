@@ -130,12 +130,14 @@ function Format-WindowDate {
     return $Date.ToString('yyyy-MM-dd')
 }
 
-# Update-StatusPanel: fills one panel. Without a record: "never recorded".
+# Update-StatusPanel: fills one panel. Without a record: "never recorded". With
+# an interval of 0, the next one reads "off".
 function Update-StatusPanel {
     param($Panel, $Item)
     $Panel.LastDone.Text = if ($null -ne $Item.LastDone) { "$(Format-WindowDate $Item.LastDone '') ($(Format-ReminderAge $Item.AgeDays))" } else { 'never recorded' }
     $Panel.LastSkipped.Text = Format-WindowDate $Item.LastSkipped 'never'
-    if ($null -eq $Item.NextDue) { $Panel.NextDue.Text = 'now' }
+    if ($Item.Off) { $Panel.NextDue.Text = 'off' }
+    elseif ($null -eq $Item.NextDue) { $Panel.NextDue.Text = 'now' }
     elseif ($Item.Due) { $Panel.NextDue.Text = "$(Format-WindowDate $Item.NextDue '') (due)" }
     else { $Panel.NextDue.Text = Format-WindowDate $Item.NextDue '' }
     if ($Item.Kind -eq 'mirror') {
@@ -210,8 +212,8 @@ function New-SettingsGroup {
     $table = New-WindowTable 2
     $ui = @{
         Enabled = New-CheckBox 'Reminders on' $Settings.Enabled
-        SystemDays = New-NumberBox $Settings.SystemDays 1 365
-        MirrorDays = New-NumberBox $Settings.MirrorDays 1 365
+        SystemDays = New-NumberBox $Settings.SystemDays 0 365
+        MirrorDays = New-NumberBox $Settings.MirrorDays 0 365
         GapHours = New-NumberBox $Settings.GapHours 0 720
         Logon = New-CheckBox 'Check at sign-in' $Settings.TriggerLogon
         Unlock = New-CheckBox 'Check when the screen is unlocked' $Settings.TriggerUnlock
@@ -225,7 +227,7 @@ function New-SettingsGroup {
     $ui.Time.Value = [datetime]::ParseExact($Settings.DailyTime, 'HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
 
     $table.Controls.Add($ui.Enabled); $table.SetColumnSpan($ui.Enabled, 2)
-    foreach ($row in @(@('System backup every (days):', $ui.SystemDays), @('Mirror every (days):', $ui.MirrorDays), @('At most one notification every (hours):', $ui.GapHours))) {
+    foreach ($row in @(@('System backup every (days, 0 = off):', $ui.SystemDays), @('Mirror every (days, 0 = off):', $ui.MirrorDays), @('At most one notification every (hours):', $ui.GapHours))) {
         $table.Controls.Add((New-WindowLabel $row[0]))
         $table.Controls.Add($row[1])
     }

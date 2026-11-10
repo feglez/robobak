@@ -1216,11 +1216,15 @@ C7 200 200 _0 0000000000FF Errores CRC
     Assert-Equal 'False|7|21|0|False|False|False|08:30' "$($set.Enabled)|$($set.SystemDays)|$($set.MirrorDays)|$($set.GapHours)|$($set.TriggerLogon)|$($set.TriggerUnlock)|$($set.TriggerDaily)|$($set.DailyTime)" "every setting is read, and a gap of 0 is valid"
     Assert-True ($null -eq $set.Warning) "valid settings: no warning"
 
+    Write-RemFile $remDir 'settings.json' '{"reminders":{"systemDays":0,"mirrorDays":0}}'
+    $set = Read-ReminderSettings $remDir
+    Assert-True ($set.SystemDays -eq 0 -and $set.MirrorDays -eq 0 -and $null -eq $set.Warning) "an interval of 0 is valid: it turns that reminder off"
+
     Write-RemFile $remDir 'settings.json' '{"robobak":{"deleteWarnFiles":9}}'
     $set = Read-ReminderSettings $remDir
     Assert-True ($set.SystemDays -eq 14 -and $null -eq $set.Warning) "no reminders section: the defaults, no warning"
 
-    Write-RemFile $remDir 'settings.json' '{"reminders":{"enabled":"yes","systemDays":0,"mirrorDays":"x","gapHours":-1,"triggerDaily":1,"dailyTime":"25:00"}}'
+    Write-RemFile $remDir 'settings.json' '{"reminders":{"enabled":"yes","systemDays":-1,"mirrorDays":"x","gapHours":-1,"triggerDaily":1,"dailyTime":"25:00"}}'
     $set = Read-ReminderSettings $remDir
     Assert-Equal 'True|14|14|24|True|12:00' "$($set.Enabled)|$($set.SystemDays)|$($set.MirrorDays)|$($set.GapHours)|$($set.TriggerDaily)|$($set.DailyTime)" "invalid values fall back to their defaults"
     foreach ($key in @('enabled', 'systemDays', 'mirrorDays', 'gapHours', 'triggerDaily', 'dailyTime')) { Assert-Contains $set.Warning $key "the warning names $key" }
@@ -1296,6 +1300,13 @@ C7 200 200 _0 0000000000FF Errores CRC
     $st = Get-ReminderStatus -Records @((New-Rec '2026-06-10 12:00:00' 'system'), (New-Rec '2026-06-01 12:00:00' 'mirror')) -Settings $custom -Now $now
     Assert-True ($st.System.Due -and -not $st.Mirror.Due) "each kind uses its own interval"
 
+    $mirrorOff = [pscustomobject]@{ SystemDays = 14; MirrorDays = 0 }
+    $st = Get-ReminderStatus -Records @() -Settings $mirrorOff -Now $now
+    Assert-True ($st.System.Due -and -not $st.Mirror.Due) "an interval of 0: never due, even with no records"
+    Assert-True ($st.Mirror.Off -and -not $st.System.Off -and $null -eq $st.Mirror.NextDue) "it's off, with no next date"
+    $st = Get-ReminderStatus -Records @(New-Rec '2026-05-01 12:00:00' 'mirror') -Settings $mirrorOff -Now $now
+    Assert-True ((-not $st.Mirror.Due) -and $st.Mirror.AgeDays -eq 45) "an old mirror isn't due either, and its age is still known"
+
     $st = Get-ReminderStatus -Records @((New-Rec '2026-05-01 12:00:00' 'system'), (New-Rec '2026-06-10 12:00:00' 'system' 'SYSIMG_1' 'skipped')) -Settings $rs -Now $now
     Assert-True (-not $st.System.Due) "a skip postpones the next reminder by one interval"
     Assert-Equal 45 $st.System.AgeDays "the age is still that of the last backup actually done"
@@ -1360,6 +1371,10 @@ C7 200 200 _0 0000000000FF Errores CRC
     $never = Get-ReminderStatus -Records @() -Settings $rs -Now $now
     $d = Get-ReminderDecision -Settings $rs -Status $never -Locked $false -LastNotification $null -Now $now
     Assert-Equal 'System backup: never recorded.|Mirror: never recorded.' ($d.Lines -join '|') "no records: 'never recorded', and no drive"
+    $d = Get-ReminderDecision -Settings $rs -Status (Get-ReminderStatus -Records @() -Settings $mirrorOff -Now $now) -Locked $false -LastNotification $null -Now $now
+    Assert-Equal 'System backup: never recorded.' ($d.Lines -join '|') "a reminder that's off is never listed"
+    $bothOff = [pscustomobject]@{ SystemDays = 0; MirrorDays = 0 }
+    Assert-Equal 'nothing' (Get-ReminderDecision -Settings $rs -Status (Get-ReminderStatus -Records @() -Settings $bothOff -Now $now) -Locked $false -LastNotification $null -Now $now).Action "both off: no notification"
     $skipOnly = Get-ReminderStatus -Records @(New-Rec '2026-05-20 12:00:00' 'system' 'SYSIMG_1' 'skipped') -Settings $rs -Now $now
     Assert-Equal 'System backup: never done.' (Format-ReminderLine $skipOnly.System) "only skips: 'never done'"
 
@@ -1492,6 +1507,15 @@ C7 200 200 _0 0000000000FF Errores CRC
     $null = Add-RunRecord -LocalDir $j2Dir -Kind 'mirror' -Source 'DATA' -Destination 'BACKUP_1' -Result 'ok' -Verification 'passed' -Date (Get-Date).AddDays(-1)
     $out = Invoke-ReminderTest "local=$j2Dir" @('-Check')
     Assert-Contains $out "RoboBak check: nothing." "nothing due: nothing"
+
+    $j4Dir = Join-Path $TestRoot 'rem_no_mirror'
+    $null = Add-RunRecord -LocalDir $j4Dir -Kind 'system' -Source 'PC' -Destination 'SYSIMG_1' -Result 'ok' -Verification 'not performed' -Date (Get-Date).AddDays(-1)
+    Save-ReminderSettings $j4Dir ([pscustomobject]@{ Enabled = $true; SystemDays = 14; MirrorDays = 0; GapHours = 24; TriggerLogon = $true; TriggerUnlock = $true; TriggerDaily = $true; DailyTime = '12:00' })
+    $out = Invoke-ReminderTest "local=$j4Dir" @('-Check')
+    Assert-Contains $out "RoboBak check: nothing." "a computer that never mirrors, with the mirror interval at 0: nothing"
+    $out = Invoke-ReminderTest "local=$j4Dir" @('-TestBuild')
+    Assert-True ($out -match 'PANEL mirror: done=never recorded \| skipped=never \| next=off \| drive=none recorded yet \| skip=False') "the window shows that mirror reminder as off, with Skip disabled"
+    Assert-Contains $out "SETTINGS: on=True system=14 mirror=0 " "and its setting reads 0"
 
     $out = Invoke-ReminderTest "S=$TestRoot|DATA_T" @('-Check')
     Assert-Contains $out "System backup: never recorded." "test mode without local=: no records, so everything is due"

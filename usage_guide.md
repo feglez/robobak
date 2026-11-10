@@ -266,6 +266,7 @@ Verification duration: 00:02:10
 - **Ignored by Git** (`.gitignore`), so it's never committed or published. Beware: `git clean -x` deletes ignored files, including `local\`.
 - **Back it up before reinstalling Windows or moving to another computer:** copy the whole `local\` folder somewhere safe (an external drive, for example). After installing RoboBak again, put it back next to `robobak.ps1`. Without it, everything still works, but the records start from zero.
 - **A copy is enough:** the files are plain text. If you use the [reminders](#reminders), run `install-reminders.ps1` again afterwards, because the shortcut and the scheduled task aren't in this folder.
+- **More than one computer:** each one keeps its own `local\`, so its window and reminders only know the backups recorded on it. On a computer that only makes system backups, set **Mirror every (days)** to `0` in the [window](#the-window), or it keeps reminding you of a mirror that never comes.
 
 ## Settings
 
@@ -311,8 +312,8 @@ The [reminders window](#reminders) keeps its own section, `reminders`, and rewri
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `enabled` | `true` | Reminders on or off. Off also disables the scheduled task |
-| `systemDays` | `14` | Days between system backups before one is due |
-| `mirrorDays` | `14` | Days between mirrors before one is due |
+| `systemDays` | `14` | Days between system backups before one is due. `0` turns this reminder off |
+| `mirrorDays` | `14` | Days between mirrors before one is due. `0` turns this reminder off, for example on a computer that only makes system backups |
 | `gapHours` | `24` | At most one notification every this many hours. `0` means no limit |
 | `triggerLogon`, `triggerUnlock`, `triggerDaily` | `true` | When the check runs: at sign-in, when the screen is unlocked, and every day |
 | `dailyTime` | `12:00` | The time of the daily check, as `HH:mm` |
@@ -441,10 +442,10 @@ It removes the shortcut and the scheduled task, then asks before deleting `local
 
 Open **RoboBak** from the Start menu, or run `.\robobak-reminders.ps1`.
 
-- **For the system backup and the mirror:** when it was last done, when it was last skipped, and when the next one is due. Before any record exists, it says `never recorded`, and the backup counts as due.
+- **For the system backup and the mirror:** when it was last done, when it was last skipped, and when the next one is due. Before any record exists, it says `never recorded`, and the backup counts as due, unless its interval is `0`: then **Next due** reads `off`, and it's never due.
 - **Suggested drive:** the backup drive whose last successful copy is oldest. It only knows drives that have a successful mirror in `runs.csv`; failed and skipped lines don't count.
 - **Skip:** enabled only for a backup that's due. It writes a `skipped` line, and the next reminder comes one interval later. The age shown in notifications remains that of the last backup actually done.
-- **Settings:** reminders on or off, the two intervals, the gap between notifications, and when the check runs. **Save** writes the `reminders` section of `local\settings.json` and rewrites the scheduled task.
+- **Settings:** reminders on or off, the two intervals (`0` turns one of them off), the gap between notifications, and when the check runs. **Save** writes the `reminders` section of `local\settings.json` and rewrites the scheduled task.
 
 ### The check
 

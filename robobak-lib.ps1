@@ -994,7 +994,7 @@ $script:ReminderShortcutName = 'RoboBak.lnk'
 # missing file, section or key means the default; a value that can't be read is
 # reported in .Warning and replaced by its default.
 #   enabled                                     reminders on or off (default on)
-#   systemDays, mirrorDays                      interval in days (default 14)
+#   systemDays, mirrorDays                      interval in days (default 14, 0 = that reminder off)
 #   gapHours                                    at most one notification per this many hours (default 24, 0 = no limit)
 #   triggerLogon, triggerUnlock, triggerDaily   when the check runs (default all on)
 #   dailyTime                                   HH:mm for the daily check (default 12:00)
@@ -1022,7 +1022,7 @@ function Read-ReminderSettings {
         if ($null -eq $value) { continue }
         if ($value -is [bool]) { $result.($pair[1]) = $value } else { $bad += $pair[0] }
     }
-    foreach ($pair in @(@('systemDays', 'SystemDays', 1), @('mirrorDays', 'MirrorDays', 1), @('gapHours', 'GapHours', 0))) {
+    foreach ($pair in @(@('systemDays', 'SystemDays', 0), @('mirrorDays', 'MirrorDays', 0), @('gapHours', 'GapHours', 0))) {
         $value = $section.($pair[0])
         if ($null -eq $value) { continue }
         $number = 0.0
@@ -1133,8 +1133,10 @@ function Get-SuggestedDrive {
 # (result "ok") and skipped, when the next one is due, and whether it's due now.
 # The interval counts from the last done-or-skipped record, and a backup is due
 # from the start of the resulting date, which is what the window shows. A backup
-# with no record is due. AgeDays is always the age of the last backup actually done, in
-# calendar days, so yesterday evening is "1 day ago" even under 24 hours later.
+# with no record is due. An interval of 0 turns the reminder off: it's never due
+# and has no next date, for example on a computer that never mirrors. AgeDays is
+# always the age of the last backup actually done, in calendar days, so
+# yesterday evening is "1 day ago" even under 24 hours later.
 function Get-ReminderItem {
     param($Records, [string]$Kind, [double]$IntervalDays, [datetime]$Now)
     $list = @(Get-DatedRecords $Records $Kind)
@@ -1144,11 +1146,12 @@ function Get-ReminderItem {
     $lastSkipped = if ($skipped.Count -gt 0) { $skipped[$skipped.Count - 1].Date } else { $null }
     $base = $lastDone
     if ($null -ne $lastSkipped -and ($null -eq $base -or $lastSkipped -gt $base)) { $base = $lastSkipped }
-    $nextDue = if ($null -ne $base) { $base.AddDays($IntervalDays) } else { $null }
+    $off = ($IntervalDays -le 0)
+    $nextDue = if ($null -ne $base -and -not $off) { $base.AddDays($IntervalDays) } else { $null }
     $age = if ($null -ne $lastDone) { [int][math]::Max(0, ($Now.Date - $lastDone.Date).Days) } else { $null }
     return [pscustomobject][ordered]@{
-        Kind = $Kind; LastDone = $lastDone; LastSkipped = $lastSkipped; NextDue = $nextDue
-        Due = ($null -eq $nextDue -or $Now.Date -ge $nextDue.Date); AgeDays = $age; SuggestedDrive = $null
+        Kind = $Kind; Off = $off; LastDone = $lastDone; LastSkipped = $lastSkipped; NextDue = $nextDue
+        Due = ((-not $off) -and ($null -eq $nextDue -or $Now.Date -ge $nextDue.Date)); AgeDays = $age; SuggestedDrive = $null
     }
 }
 
