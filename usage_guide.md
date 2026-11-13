@@ -535,7 +535,7 @@ In the task's **Backup options**:
 ### The session, every 2 weeks
 
 1. **Connect** backup drive A, and backup drive B if it's B's turn for the mirror. Mount the VeraCrypt volumes. The image partition appears by itself.
-2. **See whether this session makes a Full.** Open the task's folder on the image partition (for example `S:\Hasleo\System\`). Hasleo's file names carry the type, as in `System_YYYYMMDD_Full_V2_1.DBI`. If three files come after the newest `_Full_` one, make a Full this time. What an incremental's name looks like is an inference until you've seen one.
+2. **See whether this session makes a Full.** Open the task's folder on the image partition (for example `S:\Hasleo\System\`). Hasleo's file names carry the type, as in `System_YYYYMMDD_Full_V2_1.DBI` and `System_YYYYMMDD_Incremental_V3_1.DBI`. If three files come after the newest `_Full_` one, make a Full this time.
 3. **If you use WSL, close it,** so that its disk file is copied in a consistent state. In PowerShell:
    ```powershell
    wsl --shutdown
